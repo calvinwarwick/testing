@@ -51,6 +51,40 @@ function orderValueDollars(entry: string, size: number): number {
   return (cents / 100) * size;
 }
 
+function normalizeUnixSec(n: number | undefined): number | null {
+  if (n == null || !Number.isFinite(n)) return null;
+  // Accept either seconds or milliseconds.
+  return n > 1_000_000_000_000 ? Math.floor(n / 1000) : Math.floor(n);
+}
+
+function normalizedWindowRange(
+  marketSlug: string,
+  startRaw: number | undefined,
+  endRaw: number | undefined
+): { start: number; end: number } | null {
+  const FIVE_MIN = 300;
+  const snapToFiveMin = (sec: number): number => Math.floor(sec / FIVE_MIN) * FIVE_MIN;
+  const start = normalizeUnixSec(startRaw);
+  const end = normalizeUnixSec(endRaw);
+  if (start != null && end != null) {
+    const orderedStart = Math.min(start, end);
+    const orderedEnd = Math.max(start, end);
+    // For BTC 5m windows, treat anything close to 5 minutes as valid,
+    // but always snap to exact 5-minute boundaries for display.
+    const span = orderedEnd - orderedStart;
+    if (span >= 240 && span <= 360) {
+      const snappedStart = snapToFiveMin(orderedStart);
+      return { start: snappedStart, end: snappedStart + FIVE_MIN };
+    }
+  }
+  const m = marketSlug.match(/^btc-updown-5m-(\d{9,})$/);
+  if (!m) return null;
+  const slugTs = Number(m[1]);
+  if (!Number.isFinite(slugTs)) return null;
+  const snappedStart = snapToFiveMin(slugTs);
+  return { start: snappedStart, end: snappedStart + FIVE_MIN };
+}
+
 /** Derive log category from level + message for colouring */
 function getLogCategory(entry: { level: string; message: string }): string {
   const { level, message } = entry;
@@ -111,14 +145,24 @@ function useTimeET() {
 }
 
 const DEFAULT_PAGE_SIZE = 10;
-const POSITION_ROW_PX = 56;
-const POSITION_FOOTER_PX = 42;
+const POSITION_ROW_PX = 60;
+const POSITION_FOOTER_PX = 46;
+const POSITION_SAFETY_PX = 8;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 
 type PositionsTab = "open" | "closed";
 
 const LOG_CATEGORIES = ["all", "trade", "settlement", "risk", "error", "warn", "info", "debug"] as const;
 type LogCategory = typeof LOG_CATEGORIES[number];
+
+function getChartDomain(points: Array<{ t: number }>): [number, number] | undefined {
+  if (points.length === 0) return undefined;
+  const first = points[0].t;
+  const last = points[points.length - 1].t;
+  if (last > first) return [first, last];
+  const delta = first > 1_000_000_000 ? 1000 : 1;
+  return [first, first + delta];
+}
 
 export default function App() {
   const { connected, state, logs, error, pnlHistory, btcHistory } =
@@ -133,6 +177,8 @@ export default function App() {
   const logsContainerRef = useRef<HTMLDivElement>(null);
   const positionsContainerRef = useRef<HTMLDivElement>(null);
   const returnToBottomTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevBtcPriceRef = useRef<number | null>(null);
+  const [btcDirection, setBtcDirection] = useState<"up" | "down" | "flat">("flat");
   const timeET = useTimeET();
   const btcPrice = state?.btcPrice ?? 0;
   const totalProfit = state?.stats?.totalProfit ?? 0;
@@ -201,10 +247,25 @@ export default function App() {
     btcHistory.length > 0
       ? btcHistory.filter((pt) => pt.t >= fiveMinAgo)
       : btcSeries;
+  const pnlChartSeries = [...pnlChartData].sort((a, b) => a.t - b.t);
+  const btcChartSeries = [...btcChartData].sort((a, b) => a.t - b.t);
+  const pnlXDomain = getChartDomain(pnlChartSeries);
+  const btcXDomain = getChartDomain(btcChartSeries);
   const liveWindowRemainingSec =
     state?.windowEndTime != null
       ? Math.max(0, state.windowEndTime - Math.floor(Date.now() / 1000))
       : Math.max(0, state?.windowRemainingSec ?? 0);
+
+  useEffect(() => {
+    if (state?.btcPrice == null) return;
+    const prev = prevBtcPriceRef.current;
+    if (prev != null) {
+      if (state.btcPrice > prev) setBtcDirection("up");
+      else if (state.btcPrice < prev) setBtcDirection("down");
+      else setBtcDirection("flat");
+    }
+    prevBtcPriceRef.current = state.btcPrice;
+  }, [state?.btcPrice]);
 
   // Auto-scroll logs to bottom when following; after 30s of no scroll interaction, return to bottom
   useEffect(() => {
@@ -225,7 +286,10 @@ export default function App() {
     const computeRows = () => {
       const next = Math.max(
         1,
-        Math.floor((el.clientHeight - POSITION_FOOTER_PX) / POSITION_ROW_PX)
+        Math.floor(
+          (el.clientHeight - POSITION_FOOTER_PX - POSITION_SAFETY_PX) /
+            POSITION_ROW_PX
+        )
       );
       setPositionsRowsPerPage((prev) => (prev === next ? prev : next));
     };
@@ -375,7 +439,7 @@ export default function App() {
           <div className="flex-1 min-h-[140px]">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
-                data={pnlChartData}
+                data={pnlChartSeries}
                 margin={{ top: 4, right: 4, left: 4, bottom: 4 }}
               >
                 <Line
@@ -385,7 +449,7 @@ export default function App() {
                   strokeWidth={1.5}
                   dot={false}
                 />
-                <XAxis dataKey="t" hide type="number" />
+                <XAxis dataKey="t" hide type="number" domain={pnlXDomain} />
                 <YAxis hide domain={["dataMin", "dataMax"]} />
               </LineChart>
             </ResponsiveContainer>
@@ -397,13 +461,32 @@ export default function App() {
           <h2 className="text-edge text-xs uppercase tracking-wider mb-1">
             BTC/USD (5M LIVE)
           </h2>
-          <div className="font-mono text-3xl font-medium text-primary mb-2">
-            {btcPrice ? formatUsdSmall(btcPrice) : "—"}
+          <div
+            className={`font-mono text-3xl font-medium mb-2 inline-flex items-center ${
+              btcDirection === "up"
+                ? "text-positive"
+                : btcDirection === "down"
+                  ? "text-negative"
+                  : "text-primary"
+            }`}
+          >
+            {btcPrice ? (
+              <>
+                {formatUsdSmall(btcPrice)}
+                <span className="ml-2 text-2xl leading-none self-center">
+                  {btcDirection === "up"
+                    ? "▲"
+                    : btcDirection === "down"
+                      ? "▼"
+                      : "•"}
+                </span>
+              </>
+            ) : "—"}
           </div>
           <div className="flex-1 min-h-[140px]">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
-                data={btcChartData}
+                data={btcChartSeries}
                 margin={{ top: 4, right: 4, left: 4, bottom: 4 }}
               >
                 <Line
@@ -416,7 +499,7 @@ export default function App() {
                 <XAxis
                   dataKey="t"
                   hide
-                  domain={btcHistory.length > 0 ? [fiveMinAgo, Date.now()] : undefined}
+                  domain={btcXDomain}
                   type="number"
                 />
                 <YAxis hide domain={["dataMin", "dataMax"]} />
@@ -428,15 +511,15 @@ export default function App() {
         {/* Last 10 resolved 5min BTC markets (UP/DOWN) - from Polymarket */}
         <section className="col-span-4 bg-bg-panel border-b border-edge p-2 flex flex-col min-h-0">
           <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
-            HISTORICAL MARKETS ({state?.historicalMarkets?.length ?? 0} total)
+            HISTORICAL MARKETS ({Math.min(8, state?.historicalMarkets?.length ?? 0)} shown)
           </h2>
           <div className="flex-1 overflow-y-auto min-h-0">
             {(() => {
               const markets = state?.historicalMarkets ?? [];
-              const last10 = [...markets]
+              const last8 = [...markets]
                 .sort((a, b) => b.windowEnd - a.windowEnd)
-                .slice(0, 10);
-              if (last10.length === 0) {
+                .slice(0, 8);
+              if (last8.length === 0) {
                 return (
                   <div className="py-4 text-center text-muted text-sm">
                     Waiting for resolved markets feed...
@@ -445,7 +528,7 @@ export default function App() {
               }
               return (
                 <ul className="space-y-0">
-                  {last10.map((m) => (
+                  {last8.map((m) => (
                     <li
                       key={m.windowEnd}
                       className="flex items-center justify-between py-2.5 pl-2 border-b border-edge last:border-0"
@@ -719,10 +802,18 @@ export default function App() {
           >
             {(() => {
               const nowSec = Math.floor(Date.now() / 1000);
+              const isExpired = (e: (typeof executions)[number]): boolean => {
+                const window = normalizedWindowRange(
+                  e.marketSlug,
+                  e.marketWindowStart,
+                  e.marketWindowEnd
+                );
+                return window != null ? window.end <= nowSec : true;
+              };
               const openList = executions.filter(
-                (e) => e.fullyExecuted && !e.settled && e.marketWindowEnd > nowSec
+                (e) => e.fullyExecuted && !e.settled && !isExpired(e)
               );
-              const closedList = executions.filter((e) => e.settled);
+              const closedList = executions.filter((e) => e.settled || isExpired(e));
               const list = positionsTab === "open" ? openList : closedList;
               const displayList = [...list].reverse();
               const totalPages = Math.max(
@@ -745,7 +836,7 @@ export default function App() {
               }
               return (
                 <>
-                  <div className="flex-1 overflow-y-auto min-h-0">
+                  <div className="flex-1 overflow-hidden min-h-0">
                     {pageList.map((e, i) => {
                       const orderValue = orderValueDollars(e.entry, e.size);
                       const entryCents = parseFloat(String(e.entry).replace(/[^\d.]/g, "")) || 0;
@@ -753,9 +844,14 @@ export default function App() {
                       const isOpen = positionsTab === "open";
                       const displayProfit = isOpen && e.unrealizedProfit != null ? e.unrealizedProfit : e.actualProfit;
                       const showLive = isOpen && e.unrealizedProfit != null;
+                      const normalizedWindow = normalizedWindowRange(
+                        e.marketSlug,
+                        e.marketWindowStart,
+                        e.marketWindowEnd
+                      );
                       const marketLabel =
-                        e.marketWindowStart != null && e.marketWindowEnd != null
-                          ? formatWindowRange(e.marketWindowStart, e.marketWindowEnd)
+                        normalizedWindow != null
+                          ? formatWindowRange(normalizedWindow.start, normalizedWindow.end)
                           : e.marketSlug.replace(/^btc-updown-5m-/, "");
                       return (
                         <div
@@ -780,7 +876,7 @@ export default function App() {
                             </div>
                             <div className="flex items-center gap-2 text-muted text-xs font-mono">
                               <span>Entry {formatUsdSmall(entryUsd)}</span>
-                              <span>Cost {formatUsd(orderValue)}</span>
+                              <span>Cost {formatUsdSmall(orderValue)}</span>
                               <span className={e.settled ? "text-positive" : ""}>
                                 {e.lossCapped
                                   ? "Stopped"
@@ -804,7 +900,7 @@ export default function App() {
                               }
                             >
                               {displayProfit >= 0 ? "+" : ""}
-                              {formatUsd(displayProfit)}
+                              {formatUsdSmall(displayProfit)}
                             </span>
                             {e.lossCapped && (
                               <span className="text-muted text-xs">stopped at 5%</span>

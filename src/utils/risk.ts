@@ -44,6 +44,13 @@ export class RiskManager {
   }
 
   /**
+   * Restore open position count after replaying persisted unsettled trades.
+   */
+  restoreOpenPositions(count: number): void {
+    this.openPositions = Math.max(0, Math.floor(count));
+  }
+
+  /**
    * Check if a trade is allowed by risk limits.
    * Returns { allowed: true } or { allowed: false, reason: string }.
    */

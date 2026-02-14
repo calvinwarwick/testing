@@ -10,6 +10,19 @@ const MAX_LOGS = 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 const MAX_BTC_POINTS_5M = 60; // ~1 point per 5s over 5m
 
+function parseLogTimestampMs(ts: string): number {
+  // Stored as "YYYY-MM-DD HH:mm:ss.SSS"; normalize for Date parsing.
+  const normalized = ts.includes("T") ? ts : ts.replace(" ", "T");
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function sortLogsChronological(entries: LogEntry[]): LogEntry[] {
+  return [...entries].sort(
+    (a, b) => parseLogTimestampMs(a.timestamp) - parseLogTimestampMs(b.timestamp)
+  );
+}
+
 export interface HistoricalMarket {
   windowStart: number;
   windowEnd: number;
@@ -112,7 +125,11 @@ export function useBotConnection() {
           const s = msg.payload as BotState;
           setState(s);
           if (Array.isArray(s.recentLogs) && s.recentLogs.length > 0) {
-            setLogs((prev) => (prev.length > 0 ? prev : s.recentLogs!));
+            setLogs((prev) =>
+              prev.length > 0
+                ? prev
+                : sortLogsChronological(s.recentLogs!).slice(-MAX_LOGS)
+            );
           }
           if (s.stats.totalProfit !== undefined) {
             setPnlHistory((prev) => {
@@ -131,8 +148,13 @@ export function useBotConnection() {
           }
         } else if (msg.type === "log") {
           setLogs((prev) => {
-            const next = [...prev, msg.payload as LogEntry];
-            return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next;
+            const next = sortLogsChronological([
+              ...prev,
+              msg.payload as LogEntry,
+            ]);
+            return next.length > MAX_LOGS
+              ? next.slice(next.length - MAX_LOGS)
+              : next;
           });
         }
       } catch (_) {}

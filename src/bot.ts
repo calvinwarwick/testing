@@ -7,6 +7,8 @@ import {
   logger,
   loadTradeRecords,
   getTradeRecords,
+  getTradeRecordById,
+  getUnsettledTradeRecords,
   updateTradeSettlement,
   loadHistoricalMarkets,
   recordHistoricalMarket,
@@ -18,6 +20,10 @@ import {
   getCurrentFiveMinWindow,
   secondsRemainingInWindow,
 } from "./utils/time";
+import {
+  calculateReservedCapital,
+  decideDemoCapitalSizing,
+} from "./utils/demo-capital";
 import {
   BotConfig,
   PolymarketMarket,
@@ -44,6 +50,7 @@ import type { DashboardServer, DashboardState } from "./dashboard-server";
  */
 const MAX_EXECUTIONS_FOR_DASHBOARD = 50;
 const MAX_EXCHANGE_PRICE_AGE_MS = 10000;
+const EXECUTION_END_BUFFER_SEC = 3;
 
 export class PolymarketArbBot {
   private readonly config: BotConfig;
@@ -137,7 +144,10 @@ export class PolymarketArbBot {
   async start(): Promise<void> {
     logger.info("=== Polymarket Bot Starting ===");
     logger.info(`Mode: ${this.config.dryRun ? "DRY RUN (demo)" : "LIVE TRADING"}`);
-    logger.info(`Strategy: ${this.config.directionalOnly ? "directional only" : this.config.pureArbOnly ? "pure arbitrage only" : "arb + directional"}`);
+    logger.info("Strategy: directional edge");
+    if (this.config.pureArbOnly) {
+      logger.warn("PURE_ARB_ONLY=true is ignored in directional-edge runtime");
+    }
     logger.info(`Min profit threshold: ${this.config.minProfitThresholdCents}c`);
     logger.info(`Max position size: $${this.config.maxPositionSizeUsdc}`);
     logger.info(`Max open positions: ${this.config.maxOpenPositions ?? 999}`);
@@ -160,6 +170,8 @@ export class PolymarketArbBot {
     loadTradeRecords();
     loadHistoricalMarkets();
     loadPersistentLogs();
+    this.syncLifetimeProfitFromTradeLog();
+    this.restoreRuntimeStateFromTradeRecords();
 
     // Wait a moment for exchange price to arrive
     await this.sleep(2000);
@@ -184,6 +196,121 @@ export class PolymarketArbBot {
 
     this.printStats();
     logger.info("=== Bot Stopped ===");
+  }
+
+  private getExecutionKey(execution: ArbitrageExecution): string {
+    return `${execution.opportunity.market.slug}-${execution.opportunity.detectedAt}`;
+  }
+
+  private getExecutionTradeId(execution: ArbitrageExecution): string | undefined {
+    const isUp = execution.opportunity.exchangeSignal === "UP";
+    return isUp ? execution.yesTrade.orderId : execution.noTrade.orderId;
+  }
+
+  /**
+   * Recompute realized lifetime profit/wins from persisted trade log.
+   * This avoids drift from in-memory counters after restarts.
+   */
+  private syncLifetimeProfitFromTradeLog(): void {
+    const settled = getTradeRecords().filter(
+      (t) => t.settled && typeof t.profit === "number"
+    );
+    this.lifetimeTotalProfit = settled.reduce((sum, t) => sum + (t.profit ?? 0), 0);
+    this.lifetimeProfitableTrades = settled.filter((t) => (t.profit ?? 0) > 0).length;
+  }
+
+  private getInMemoryTradeIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const execution of this.executions) {
+      const id = this.getExecutionTradeId(execution);
+      if (id) ids.add(id);
+    }
+    return ids;
+  }
+
+  /**
+   * Rebuild in-memory execution/risk tracking from persisted directional trades.
+   * This keeps restart behavior deterministic for open-position limits/capital checks.
+   */
+  private restoreRuntimeStateFromTradeRecords(): void {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const trades = getTradeRecords();
+
+    const restored: ArbitrageExecution[] = [];
+    for (const t of trades) {
+      const key = `${t.marketSlug}-${t.timestamp}`;
+      if (t.settled) {
+        this.releasedPositionKeys.add(key);
+        continue;
+      }
+      if (t.type !== "directional") continue;
+      if (t.marketWindowEnd <= nowSec) continue;
+
+      const sideIsUp = t.side === "UP";
+      const tradeResult = {
+        success: true as const,
+        orderId: t.id,
+        side: sideIsUp ? ("YES" as const) : ("NO" as const),
+        price: t.entryPrice,
+        size: t.size,
+        filledSize: t.size,
+        timestamp: t.timestamp,
+      };
+      const oppositeResult = {
+        success: false as const,
+        side: sideIsUp ? ("NO" as const) : ("YES" as const),
+        price: 0,
+        size: 0,
+        timestamp: t.timestamp,
+      };
+      restored.push({
+        opportunity: {
+          market: {
+            conditionId: "",
+            slug: t.marketSlug,
+            question: "",
+            yesTokenId: "",
+            noTokenId: "",
+            startTime: t.marketWindowStart,
+            endTime: t.marketWindowEnd,
+            active: true,
+          },
+          totalCost: t.cost,
+          profitPerShare: 0,
+          profitPercent: 0,
+          yesPrice: sideIsUp ? t.entryPrice : 0,
+          noPrice: sideIsUp ? 0 : t.entryPrice,
+          suggestedSize: t.size,
+          totalExpectedProfit: 0,
+          exchangePrice: {
+            exchange: "restored",
+            symbol: "BTCUSDT",
+            price: t.btcPriceAtEntry,
+            timestamp: t.timestamp,
+          },
+          exchangeSignal: t.side,
+          windowStartBtcPrice: t.btcPriceAtEntry,
+          detectedAt: t.timestamp,
+        },
+        yesTrade: sideIsUp ? tradeResult : oppositeResult,
+        noTrade: sideIsUp ? oppositeResult : tradeResult,
+        actualTotalCost: t.cost,
+        actualProfit: t.profit ?? 0,
+        fullyExecuted: true,
+        settled: false,
+      });
+    }
+
+    this.executions = restored;
+    const unsettledDirectionalCount = getUnsettledTradeRecords(nowSec).filter(
+      (t) => t.type === "directional"
+    ).length;
+    this.riskManager.restoreOpenPositions(unsettledDirectionalCount);
+    if (restored.length > 0 || unsettledDirectionalCount > 0) {
+      logger.info(
+        `Restored runtime state: ${restored.length} directional execution(s), open positions=${unsettledDirectionalCount}`
+      );
+    }
   }
 
   /**
@@ -228,9 +355,13 @@ export class PolymarketArbBot {
   private async discoverMarkets(): Promise<void> {
     const markets = await this.polymarketFeed.findActiveCryptoMarkets("BTC");
     const nowSec = Math.floor(Date.now() / 1000);
-    this.activeMarkets = markets.filter(
-      (m) => m.active && m.endTime > nowSec
-    );
+    const { startTime: currentWindowStart } = getCurrentFiveMinWindow();
+    const candidates = markets.filter((m) => m.active && m.endTime > nowSec);
+    const currentMarket =
+      candidates.find((m) => m.startTime <= nowSec && nowSec < m.endTime) ??
+      candidates.find((m) => m.startTime === currentWindowStart) ??
+      null;
+    this.activeMarkets = currentMarket ? [currentMarket] : [];
 
     if (this.activeMarkets.length === 0) {
       logger.warn("No active BTC 5-min markets found on Polymarket");
@@ -257,11 +388,12 @@ export class PolymarketArbBot {
       const capturedStartPrice = this.windowStartPrices.get(startTime);
       if (capturedStartPrice !== undefined) {
         this.detector.setWindowReference(capturedStartPrice, startTime);
-      } else if (!this.windowStartPrices.has(startTime)) {
-        // If we haven't captured this window's start yet, capture it now
-        this.windowStartPrices.set(startTime, exchangePrice.price);
-        this.detector.setWindowReference(exchangePrice.price, startTime);
-        logger.info(`Captured current window start: $${exchangePrice.price.toFixed(2)} at ${new Date(startTime * 1000).toISOString()}`);
+      } else {
+        logger.debug(
+          `Window reference unavailable for ${new Date(
+            startTime * 1000
+          ).toISOString()} (not captured near boundary yet)`
+        );
       }
     }
 
@@ -309,6 +441,7 @@ export class PolymarketArbBot {
       this.broadcastDashboardState(exchangePrice);
       return;
     }
+    this.syncLifetimeProfitFromTradeLog();
 
     // Capture window start prices for any markets that just started (within first 60 seconds)
     const nowSec = Math.floor(Date.now() / 1000);
@@ -334,6 +467,11 @@ export class PolymarketArbBot {
 
     // Check each active market for opportunities (and cache prices for unrealized PnL)
     for (const market of this.activeMarkets) {
+      if (market.endTime <= nowSec) {
+        // Markets can remain in activeMarkets briefly between discovery refreshes.
+        // Never fetch/trade on an already ended 5-min window.
+        continue;
+      }
       // For simulation mode, pass BTC prices to generate realistic lagging prices
       const actualWindowStartPrice = this.windowStartPrices.get(market.startTime);
       const prices = await this.polymarketFeed.getMarketPrices(
@@ -352,69 +490,29 @@ export class PolymarketArbBot {
         yesBestAskSize: prices.yesBestAskSize,
         noBestAskSize: prices.noBestAskSize,
       });
-      if (market.startTime <= nowSec && nowSec < market.endTime) {
-        const [yesMidpoint, noMidpoint] = await Promise.all([
-          this.polymarketFeed.getMidpointPrice(market.yesTokenId),
-          this.polymarketFeed.getMidpointPrice(market.noTokenId),
-        ]);
-        const cached = this.lastMarketPricesBySlug.get(market.slug);
-        if (cached) {
-          if (yesMidpoint != null) cached.yesMid = yesMidpoint;
-          if (noMidpoint != null) cached.noMid = noMidpoint;
-        }
-      }
-
       await this.tryStopLossExits(market.slug, exchangePrice.price);
 
-      if (this.config.directionalOnly) {
-        // --- Directional only: exchange price diverges from Polymarket ---
-        // Skip markets where we don't have the actual window start price
-        if (!actualWindowStartPrice) {
-          logger.debug(`Skipping ${market.slug}: no window start price captured`);
-          continue;
-        }
+      // --- Directional edge only ---
+      // Skip markets where we don't have the actual window start price.
+      if (actualWindowStartPrice == null) {
+        logger.debug(`Skipping ${market.slug}: no window start price captured`);
+        continue;
+      }
 
-        const minEdge = this.config.minEdgePercent ?? 10;
-        const signalThreshold = this.config.exchangeSignalThresholdPercent ?? 0.03;
-        const minMove = this.config.minExchangeMovePercent ?? 0.15;
-        const directionalOpp = this.detector.detectDirectionalOpportunity(
-          prices,
-          exchangePrice,
-          minEdge,
-          signalThreshold,
-          minMove
-        );
-        if (directionalOpp) {
-          // Override with the actual window start price for correct settlement
-          directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
-          await this.handleOpportunity(directionalOpp);
-        }
-      } else {
-        // --- Pure arbitrage: YES_ask + NO_ask < $1.00 ---
-        const arbOpportunity = this.detector.detectArbitrage(
-          prices,
-          exchangePrice
-        );
-        if (arbOpportunity) {
-          await this.handleOpportunity(arbOpportunity);
-          continue;
-        }
-        // --- Directional (unless pure-arb-only) ---
-        if (!this.config.pureArbOnly) {
-          const minEdge = this.config.minEdgePercent ?? 10;
-          const signalThreshold = this.config.exchangeSignalThresholdPercent ?? 0.03;
-          const minMove = this.config.minExchangeMovePercent ?? 0.15;
-          const directionalOpp = this.detector.detectDirectionalOpportunity(
-            prices,
-            exchangePrice,
-            minEdge,
-            signalThreshold,
-            minMove
-          );
-          if (directionalOpp) {
-            await this.handleOpportunity(directionalOpp);
-          }
-        }
+      const minEdge = this.config.minEdgePercent ?? 10;
+      const signalThreshold = this.config.exchangeSignalThresholdPercent ?? 0.03;
+      const minMove = this.config.minExchangeMovePercent ?? 0.15;
+      const directionalOpp = this.detector.detectDirectionalOpportunity(
+        prices,
+        exchangePrice,
+        minEdge,
+        signalThreshold,
+        minMove
+      );
+      if (directionalOpp) {
+        // Override with the actual window start price for correct settlement.
+        directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
+        await this.handleOpportunity(directionalOpp);
       }
     }
 
@@ -440,8 +538,15 @@ export class PolymarketArbBot {
       const { market, detectedAt, exchangeSignal } = execution.opportunity;
       if (market.slug !== marketSlug || market.endTime <= nowSec) continue;
       const key = `${market.slug}-${detectedAt}`;
-      if (this.releasedPositionKeys.has(key)) continue;
+      if (this.releasedPositionKeys.has(key) || execution.settled) continue;
       if (execution.opportunity.totalCost < 1.0) continue; // only directional
+      const existingTradeId = this.getExecutionTradeId(execution);
+      if (existingTradeId && getTradeRecordById(existingTradeId)?.settled) {
+        execution.settled = true;
+        this.releasedPositionKeys.add(key);
+        this.settlementEndPriceByKey.delete(key);
+        continue;
+      }
 
       const weBetUp = exchangeSignal === "UP";
       const filledSize = weBetUp
@@ -449,15 +554,15 @@ export class PolymarketArbBot {
         : (execution.noTrade.filledSize ?? 0);
       if (filledSize <= 0) continue;
 
-      const entryPrice = weBetUp
-        ? execution.opportunity.yesPrice
-        : execution.opportunity.noPrice;
       const sellPrice = weBetUp ? prices.yesBestBid : prices.noBestBid;
       const unrealizedProfit = sellPrice * filledSize - execution.actualTotalCost;
       const maxLoss = stopLossPercent * execution.actualTotalCost;
       if (unrealizedProfit > -maxLoss) continue; // not at stop-loss
 
-      const tokenId = weBetUp ? execution.opportunity.market.yesTokenId : execution.opportunity.market.noTokenId;
+      const tokenId = weBetUp
+        ? execution.opportunity.market.yesTokenId
+        : execution.opportunity.market.noTokenId;
+      if (!tokenId) continue;
       const side = weBetUp ? "YES" : "NO";
       logger.info(
         `Stop-loss exit: ${market.slug} | ${side} ${filledSize} @ bid $${sellPrice.toFixed(3)} | unrealized PnL=$${unrealizedProfit.toFixed(4)}`
@@ -469,9 +574,12 @@ export class PolymarketArbBot {
         : -maxLoss; // sell failed: record capped loss and show as Stopped
       execution.actualProfit = actualProfit;
       execution.lossCapped = true; // show as Stopped in UI (exited at stop-loss)
+      execution.settled = true;
       this.lifetimeTotalProfit += execution.actualProfit;
+      if (execution.actualProfit > 0) this.lifetimeProfitableTrades++;
       this.riskManager.recordSettlement(execution.actualProfit);
       this.releasedPositionKeys.add(key);
+      this.settlementEndPriceByKey.delete(key);
       const tradeId = weBetUp
         ? execution.yesTrade.orderId
         : execution.noTrade.orderId;
@@ -496,9 +604,16 @@ export class PolymarketArbBot {
     for (const execution of this.executions) {
       if (!execution.fullyExecuted) continue;
       const { market, detectedAt, exchangeSignal, windowStartBtcPrice } = execution.opportunity;
-      if (market.endTime >= nowSec) continue;
+      if (market.endTime > nowSec) continue;
       const key = `${market.slug}-${detectedAt}`;
-      if (this.releasedPositionKeys.has(key)) continue;
+      if (this.releasedPositionKeys.has(key) || execution.settled) continue;
+      const tradeId = this.getExecutionTradeId(execution);
+      if (tradeId && getTradeRecordById(tradeId)?.settled) {
+        execution.settled = true;
+        this.releasedPositionKeys.add(key);
+        this.settlementEndPriceByKey.delete(key);
+        continue;
+      }
 
       // Lock in the BTC price the first time we see the window has ended (with a price).
       // Using a later cycle's price would wrongly flip UP/DOWN if BTC moved after the window closed.
@@ -516,27 +631,17 @@ export class PolymarketArbBot {
         const filledSize = weBetUp
           ? (execution.yesTrade.filledSize ?? 0)
           : (execution.noTrade.filledSize ?? 0);
-        let actualProfit = ourSideWon ? filledSize * 1.0 - execution.actualTotalCost : -execution.actualTotalCost;
-        // Stop loss: if we had exited at 5% loss we would record this; trade shows as "Stopped" in UI.
-        // In production you must exit the position (sell) before resolution when unrealized loss hits 5%,
-        // otherwise holding to resolution loses the full amount.
-        const stopLossPercent = 0.05;
-        const maxLoss = stopLossPercent * execution.actualTotalCost;
-        if (actualProfit < 0 && actualProfit < -maxLoss) {
-          actualProfit = -maxLoss;
-          execution.lossCapped = true;
-          logger.info(`Stop loss applied: loss capped at ${stopLossPercent * 100}% (show as Stopped; exit at 5% before resolution to realize this)`);
-        }
+        const actualProfit = ourSideWon
+          ? filledSize * 1.0 - execution.actualTotalCost
+          : -execution.actualTotalCost;
         execution.actualProfit = actualProfit;
+        execution.settled = true;
         this.lifetimeTotalProfit += actualProfit;
         if (actualProfit > 0) this.lifetimeProfitableTrades++;
         this.riskManager.recordSettlement(actualProfit);
         didResolve = true;
 
         // Update trade record with settlement info
-        const tradeId = weBetUp
-          ? execution.yesTrade.orderId
-          : execution.noTrade.orderId;
         if (tradeId) {
           updateTradeSettlement(tradeId, actualProfit, priceAtEnd);
         }
@@ -561,11 +666,22 @@ export class PolymarketArbBot {
       } else if (isDirectional && typeof windowStartBtcPrice !== "number") {
         logger.warn(`Settlement skipped for ${market.slug}: missing window start price, resolving as $0`);
         execution.actualProfit = 0;
+        execution.settled = true;
+        this.riskManager.recordSettlement(0);
+        if (tradeId) {
+          updateTradeSettlement(
+            tradeId,
+            0,
+            priceAtEnd ?? execution.opportunity.exchangePrice.price
+          );
+        }
         didResolve = true;
       }
 
       if (!isDirectional || didResolve) {
-        this.riskManager.releasePosition();
+        if (!isDirectional) {
+          this.riskManager.releasePosition();
+        }
         this.releasedPositionKeys.add(key);
         this.settlementEndPriceByKey.delete(key);
       }
@@ -574,6 +690,7 @@ export class PolymarketArbBot {
 
   private broadcastDashboardState(exchangePrice: { price: number; timestamp: number } | null): void {
     if (!this.dashboard) return;
+    this.syncLifetimeProfitFromTradeLog();
     const { startTime, endTime } = getCurrentFiveMinWindow();
     const risk = this.riskManager.getState();
     const recentExecutions = this.executions.slice(-MAX_EXECUTIONS_FOR_DASHBOARD);
@@ -592,7 +709,7 @@ export class PolymarketArbBot {
       : undefined;
     const currentMarketPrices =
       marketPrices != null
-        ? { up: marketPrices.yesMid, down: marketPrices.noMid }
+        ? { up: marketPrices.yesBestAsk, down: marketPrices.noBestAsk }
         : undefined;
     const marketVolume =
       currentWindowMarket?.volumeUsd ??
@@ -613,7 +730,7 @@ export class PolymarketArbBot {
       const isDirectional = opp.totalCost >= 1.0;
       const releasedKey = `${opp.market.slug}-${opp.detectedAt}`;
       const settled = isDirectional
-        ? this.releasedPositionKeys.has(releasedKey) || e.actualProfit !== 0
+        ? this.releasedPositionKeys.has(releasedKey) || e.settled === true
         : e.fullyExecuted;
       const filledSize = side === "UP" ? (e.yesTrade.filledSize ?? 0) : (e.noTrade.filledSize ?? 0);
       const prices = this.lastMarketPricesBySlug.get(opp.market.slug);
@@ -723,34 +840,66 @@ export class PolymarketArbBot {
   private async handleOpportunity(
     opportunity: ArbitrageOpportunity
   ): Promise<void> {
-    const isDirectional = opportunity.totalCost >= 1.0;
-    const minSecLeft = this.config.minSecondsRemainingInWindow ?? 120;
-    if (isDirectional && secondsRemainingInWindow() < minSecLeft) {
+    this.syncLifetimeProfitFromTradeLog();
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (opportunity.market.endTime <= nowSec) {
       logger.debug(
-        `Skip directional: only ${secondsRemainingInWindow()}s left in window (min ${minSecLeft}s)`
+        `Skip trade: market already ended (${opportunity.market.slug})`
+      );
+      return;
+    }
+    const minSecLeft = this.config.minSecondsRemainingInWindow ?? 120;
+    const marketSecondsRemaining = opportunity.market.endTime - nowSec;
+    if (marketSecondsRemaining < minSecLeft) {
+      logger.debug(
+        `Skip directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s)`
       );
       return;
     }
 
     let toExecute = opportunity;
     if (this.config.dryRun && (this.config.demoStartingBalance ?? 1000) > 0) {
-      const starting = this.config.demoStartingBalance ?? 1000;
-      const currentBalance = Math.max(0, starting + this.lifetimeTotalProfit);
-      const maxPerTradeUsd = 0.05 * currentBalance;
-      const tradeSizeUsd = opportunity.totalCost * opportunity.suggestedSize;
-      if (tradeSizeUsd > maxPerTradeUsd) {
-        const cappedSize = Math.max(1, Math.floor(maxPerTradeUsd / opportunity.totalCost));
-        if (cappedSize < 1) {
-          logger.debug(`Skip trade: 5% of balance would be < 1 share (balance=$${currentBalance.toFixed(2)})`);
-          return;
-        }
+      const persistedTrades = getTradeRecords();
+      const decision = decideDemoCapitalSizing({
+        startingBalanceUsd: this.config.demoStartingBalance ?? 1000,
+        lifetimeProfitUsd: this.lifetimeTotalProfit,
+        reservedCapitalUsd: calculateReservedCapital(
+          this.executions,
+          this.releasedPositionKeys,
+          persistedTrades,
+          this.getInMemoryTradeIds()
+        ),
+        totalCostPerShareUsd: opportunity.totalCost,
+        suggestedSize: opportunity.suggestedSize,
+      });
+      if (!decision.allowed) {
+        logger.debug(
+          `Skip trade: demo capital check failed (${decision.reason}) ` +
+            `balance=$${decision.currentBalanceUsd.toFixed(2)} ` +
+            `reserved=$${decision.reservedCapitalUsd.toFixed(2)} ` +
+            `available=$${decision.availableBalanceUsd.toFixed(2)} ` +
+            `attempted=$${decision.attemptedNotionalUsd.toFixed(2)}`
+        );
+        return;
+      }
+
+      if (
+        decision.finalSuggestedSize != null &&
+        decision.finalSuggestedSize !== opportunity.suggestedSize
+      ) {
         toExecute = {
           ...opportunity,
-          suggestedSize: cappedSize,
-          totalExpectedProfit: opportunity.profitPerShare * cappedSize,
+          suggestedSize: decision.finalSuggestedSize,
+          totalExpectedProfit:
+            opportunity.profitPerShare * decision.finalSuggestedSize,
         };
         logger.info(
-          `Capped size to 5% of balance: $${(opportunity.totalCost * cappedSize).toFixed(2)} (balance=$${currentBalance.toFixed(2)})`
+          `Capped size by demo cash limits: attempted=$${decision.attemptedNotionalUsd.toFixed(2)} ` +
+            `final=$${(opportunity.totalCost * decision.finalSuggestedSize).toFixed(2)} ` +
+            `maxAllowed=$${decision.maxAllowedNotionalUsd.toFixed(2)} ` +
+            `balance=$${decision.currentBalanceUsd.toFixed(2)} ` +
+            `reserved=$${decision.reservedCapitalUsd.toFixed(2)} ` +
+            `available=$${decision.availableBalanceUsd.toFixed(2)}`
         );
       }
     }
@@ -765,32 +914,30 @@ export class PolymarketArbBot {
     }
 
     logger.info(
-      `Executing ${isDirectional ? "directional" : "arbitrage"} on ${toExecute.market.slug}: ` +
+      `Executing directional on ${toExecute.market.slug}: ` +
         `Expected profit: $${toExecute.totalExpectedProfit.toFixed(4)}`
     );
 
-    const execution = isDirectional
-      ? await this.trader.executeDirectional(toExecute)
-      : await this.trader.executeArbitrage(toExecute);
+    const preExecuteNowSec = Math.floor(Date.now() / 1000);
+    const remainingBeforeExecution = toExecute.market.endTime - preExecuteNowSec;
+    if (remainingBeforeExecution <= EXECUTION_END_BUFFER_SEC) {
+      logger.debug(
+        `Skip trade: ${toExecute.market.slug} too close to end (${remainingBeforeExecution}s <= ${EXECUTION_END_BUFFER_SEC}s execution buffer)`
+      );
+      return;
+    }
+
+    const execution = await this.trader.executeDirectional(toExecute);
+    execution.settled = false;
     this.executions.push(execution);
     this.riskManager.recordExecution(execution);
 
     if (execution.fullyExecuted) {
-      const isGuaranteedProfit = opportunity.totalCost < 1.0;
       this.lifetimeTradesExecuted++;
-      if (isGuaranteedProfit) {
-        this.stats.tradesExecuted++;
-        this.stats.totalProfit += execution.actualProfit;
-        this.lifetimeTotalProfit += execution.actualProfit;
-        if (execution.actualProfit > 0) {
-          this.lifetimeProfitableTrades++;
-        }
-      } else {
-        this.stats.directionalTradesExecuted++;
-        logger.info(
-          `Directional trade executed on ${opportunity.market.slug}; PnL will be realized at settlement`
-        );
-      }
+      this.stats.directionalTradesExecuted++;
+      logger.info(
+        `Directional trade executed on ${opportunity.market.slug}; PnL will be realized at settlement`
+      );
     }
   }
 
@@ -798,6 +945,7 @@ export class PolymarketArbBot {
    * Build current session snapshot for persistence (merge lifetime + risk state).
    */
   getSessionSnapshot(): PersistedSession {
+    this.syncLifetimeProfitFromTradeLog();
     const risk = this.riskManager.getState();
     return {
       totalProfit: this.lifetimeTotalProfit,

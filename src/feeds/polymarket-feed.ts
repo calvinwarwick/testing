@@ -7,6 +7,9 @@ import {
 } from "../types";
 import { logger } from "../utils/logger";
 
+const FIVE_MIN_SEC = 300;
+const MAX_ORDERBOOK_AGE_MS = 10000;
+
 /** Gamma API event shape (subset we use) */
 interface GammaEvent {
   slug?: string;
@@ -140,16 +143,15 @@ export class PolymarketFeed {
    */
   private generateSimulatedMarkets(): PolymarketMarket[] {
     const nowSec = Math.floor(Date.now() / 1000);
-    const FIVE_MIN = 300;
-    const currentWindowEnd = Math.ceil(nowSec / FIVE_MIN) * FIVE_MIN;
+    const currentWindowEnd = Math.ceil(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
 
     const markets: PolymarketMarket[] = [];
     for (let i = 0; i < 12; i++) {
-      const endTime = currentWindowEnd + i * FIVE_MIN;
-      const startTime = endTime - FIVE_MIN;
+      const endTime = currentWindowEnd + i * FIVE_MIN_SEC;
+      const startTime = endTime - FIVE_MIN_SEC;
       markets.push({
         conditionId: `sim-condition-${endTime}`,
-        slug: `btc-updown-5m-${endTime}`,
+        slug: `btc-updown-5m-${startTime}`,
         question: `Will BTC be higher at ${new Date(endTime * 1000).toISOString().slice(11, 16)} UTC?`,
         yesTokenId: `sim-yes-${endTime}`,
         noTokenId: `sim-no-${endTime}`,
@@ -180,13 +182,13 @@ export class PolymarketFeed {
     }>
   > {
     const nowSec = Math.floor(Date.now() / 1000);
-    const FIVE_MIN = 300;
     // Start from the PREVIOUS 5-min boundary; current boundary may still be unresolved.
-    const latestResolvedEnd = Math.floor(nowSec / FIVE_MIN) * FIVE_MIN - FIVE_MIN;
+    const latestResolvedStart =
+      Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC - FIVE_MIN_SEC;
     const lookback = Math.max(limit * 3, 30);
     const slugs: string[] = [];
     for (let i = 0; i < lookback; i++) {
-      slugs.push(`btc-updown-5m-${latestResolvedEnd - i * FIVE_MIN}`);
+      slugs.push(`btc-updown-5m-${latestResolvedStart - i * FIVE_MIN_SEC}`);
     }
 
     const requests = slugs.map((slug) =>
@@ -221,10 +223,11 @@ export class PolymarketFeed {
       if (!slug.startsWith("btc-updown-5m-")) continue;
       const windowStart = this.parseSlugTimestamp(slug);
       if (!windowStart || seen.has(windowStart) || windowStart > nowSec) continue;
+      if (windowStart % FIVE_MIN_SEC !== 0) continue;
       if (market.closed !== true) continue;
       // BTC up/down strategy windows are always 5 minutes; slug timestamp is the window START.
       const normalizedStart = windowStart;
-      const normalizedEnd = windowStart + FIVE_MIN;
+      const normalizedEnd = windowStart + FIVE_MIN_SEC;
       const outcome = this.resolveUpDownOutcome(market);
       if (!outcome) continue;
       seen.add(normalizedStart);
@@ -248,13 +251,14 @@ export class PolymarketFeed {
    */
   private async findBtc5MinMarketsBySlugs(): Promise<PolymarketMarket[]> {
     const nowSec = Math.floor(Date.now() / 1000);
-    const FIVE_MIN = 300;
-    // Current active window ends at the next 5-min boundary >= now (e.g. 10:50, 10:55)
-    const currentWindowEnd = Math.ceil(nowSec / FIVE_MIN) * FIVE_MIN;
-    const numWindows = 12;
+    // Slug timestamp is the 5-min window START.
+    const currentWindowStart = Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
+    // Directional runtime tracks only the current market; fetch a tiny forward set
+    // to remain resilient around boundary turnover.
+    const numWindows = 2;
     const slugs: string[] = [];
     for (let i = 0; i < numWindows; i++) {
-      slugs.push(`btc-updown-5m-${currentWindowEnd + i * FIVE_MIN}`);
+      slugs.push(`btc-updown-5m-${currentWindowStart + i * FIVE_MIN_SEC}`);
     }
 
     try {
@@ -327,20 +331,35 @@ export class PolymarketFeed {
 
         const startDate = m.startDate || m.start_date_iso;
         const endDate = m.endDate || m.end_date_iso;
-        const endTime = endDate
+        const slug = m.slug || event.slug || "";
+        const slugStart = this.parseSlugTimestamp(slug);
+        const startTimeFromSlug = slugStart ?? 0;
+        const endTimeFromSlug = slugStart != null ? slugStart + FIVE_MIN_SEC : 0;
+        const endTimeFromDate = endDate
           ? Math.floor(new Date(endDate).getTime() / 1000)
           : 0;
+        const endTime = endTimeFromSlug || endTimeFromDate;
+        const startTime =
+          startTimeFromSlug ||
+          (startDate ? Math.floor(new Date(startDate).getTime() / 1000) : 0);
+        const hasFiveMinWindow =
+          startTime > 0 &&
+          endTime > 0 &&
+          endTime - startTime === FIVE_MIN_SEC &&
+          startTime % FIVE_MIN_SEC === 0 &&
+          endTime % FIVE_MIN_SEC === 0;
+        if (!hasFiveMinWindow) continue;
         if (endTime > 0 && endTime <= nowSec) continue;
 
         out.push({
           conditionId: m.conditionId || m.condition_id || "",
-          slug: m.slug || event.slug || "",
+          slug,
           question: m.question || "",
           yesTokenId: tokenIds[0],
           noTokenId: tokenIds[1],
-          startTime: startDate
-            ? Math.floor(new Date(startDate).getTime() / 1000)
-            : 0,
+          // Gamma startDate can be market creation time, not 5-min window start.
+          // Use slug timestamp as authoritative for window alignment.
+          startTime,
           endTime,
           active: m.active !== false,
           volumeUsd:
@@ -456,6 +475,20 @@ export class PolymarketFeed {
       });
 
       const data = response.data;
+      const apiTimestampRaw =
+        (data as { timestamp?: number | string; ts?: number | string }).timestamp ??
+        (data as { ts?: number | string }).ts;
+      const apiTimestampMs =
+        typeof apiTimestampRaw === "number"
+          ? apiTimestampRaw
+          : typeof apiTimestampRaw === "string"
+            ? Number(apiTimestampRaw)
+            : NaN;
+      const normalizedTimestampMs = Number.isFinite(apiTimestampMs)
+        ? apiTimestampMs > 1_000_000_000_000
+          ? Math.floor(apiTimestampMs)
+          : Math.floor(apiTimestampMs * 1000)
+        : Date.now();
 
       const parseLevels = (
         levels: Array<{ price: string; size: string }>
@@ -469,7 +502,7 @@ export class PolymarketFeed {
         tokenId,
         bids: parseLevels(data.bids),
         asks: parseLevels(data.asks),
-        timestamp: Date.now(),
+        timestamp: normalizedTimestampMs,
       };
     } catch (error: unknown) {
       const status = (error as { response?: { status?: number } })?.response?.status;
@@ -520,6 +553,17 @@ export class PolymarketFeed {
           return this.getSimulatedMarketPrices(market, currentBtcPrice, windowStartBtcPrice);
         }
         logger.debug(`Missing order book data for market ${market.slug} (failure ${this.orderBookFailures}/5)`);
+        return null;
+      }
+      const newestBookTs = Math.max(yesBook.timestamp, noBook.timestamp);
+      const booksAgeMs = Date.now() - newestBookTs;
+      if (!Number.isFinite(booksAgeMs) || booksAgeMs > MAX_ORDERBOOK_AGE_MS) {
+        logger.debug(
+          `Skipping ${market.slug}: stale orderbook (${Math.max(
+            0,
+            Math.floor(booksAgeMs)
+          )}ms old)`
+        );
         return null;
       }
 
@@ -697,8 +741,8 @@ export class PolymarketFeed {
       price: prices[i] ?? 0,
     }));
     const best = paired.reduce((a, b) => (b.price > a.price ? b : a), paired[0]);
-    if (best.label.includes("up")) return "UP";
-    if (best.label.includes("down")) return "DOWN";
+    if (/\bup\b/.test(best.label)) return "UP";
+    if (/\bdown\b/.test(best.label)) return "DOWN";
     return null;
   }
 

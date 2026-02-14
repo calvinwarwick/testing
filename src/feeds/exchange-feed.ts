@@ -5,7 +5,7 @@ import { logger } from "../utils/logger";
 
 const AGGREGATE_INTERVAL_MS = 2000;
 const REST_TIMEOUT_MS = 5000;
-const MAX_PRICE_AGE_MS = 15000;
+const MAX_PRICE_AGE_MS = 10000;
 
 type PriceEntry = { price: number; timestamp: number };
 

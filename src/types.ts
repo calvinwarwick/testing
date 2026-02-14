@@ -168,6 +168,8 @@ export interface ArbitrageExecution {
   actualProfit: number;
   /** Whether both sides filled successfully */
   fullyExecuted: boolean;
+  /** True once settlement/exit has been accounted exactly once */
+  settled?: boolean;
   /** Set when a directional loss was capped by stop-loss (dashboard can show "capped") */
   lossCapped?: boolean;
 }

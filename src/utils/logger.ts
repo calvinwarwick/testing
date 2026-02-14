@@ -123,17 +123,31 @@ export function updateTradeSettlement(
   id: string,
   profit: number,
   btcPriceAtSettlement: number
-): void {
+): boolean {
   const trade = tradeRecords.find((t) => t.id === id);
-  if (trade) {
-    trade.settled = true;
-    trade.settledAt = Date.now();
-    trade.profit = profit;
-    trade.outcome = profit > 0 ? "win" : "loss";
-    trade.btcPriceAtSettlement = btcPriceAtSettlement;
-    saveTradeRecords();
-    logger.info(`Trade settled: ${id} ${trade.outcome} $${profit.toFixed(2)}`);
-  }
+  if (!trade) return false;
+  if (trade.settled) return false;
+  trade.settled = true;
+  trade.settledAt = Date.now();
+  trade.profit = profit;
+  trade.outcome = profit > 0 ? "win" : "loss";
+  trade.btcPriceAtSettlement = btcPriceAtSettlement;
+  saveTradeRecords();
+  logger.info(`Trade settled: ${id} ${trade.outcome} $${profit.toFixed(2)}`);
+  return true;
+}
+
+export function getTradeRecordById(id: string): TradeRecord | undefined {
+  return tradeRecords.find((t) => t.id === id);
+}
+
+export function getUnsettledTradeRecords(nowSec: number = Math.floor(Date.now() / 1000)): TradeRecord[] {
+  return tradeRecords.filter((t) => !t.settled && t.marketWindowEnd > nowSec);
+}
+
+export function isTradeSettled(id: string): boolean {
+  const trade = tradeRecords.find((t) => t.id === id);
+  return trade?.settled === true;
 }
 
 export function getTradeRecords(): TradeRecord[] {

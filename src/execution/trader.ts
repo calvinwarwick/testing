@@ -297,10 +297,7 @@ export class Trader {
     const targetSide = isUp ? "YES" : "NO";
     const tokenId = isUp ? opportunity.market.yesTokenId : opportunity.market.noTokenId;
     const price = isUp ? opportunity.yesPrice : opportunity.noPrice;
-    const size = Math.max(
-      1,
-      Math.floor(this.config.maxPositionSizeUsdc / price)
-    );
+    const size = Math.max(1, Math.floor(opportunity.suggestedSize));
 
     logger.info(
       `Executing DIRECTIONAL ${targetSide} on ${opportunity.market.slug}: ` +
@@ -326,9 +323,14 @@ export class Trader {
       actualTotalCost,
       actualProfit: 0,
       fullyExecuted: trade.success,
+      settled: false,
     };
 
     if (execution.fullyExecuted) {
+      const tradeRecordId = trade.orderId ?? `trade-${Date.now()}`;
+      if (!trade.orderId) {
+        trade.orderId = tradeRecordId;
+      }
       logger.info(
         `DIRECTIONAL EXECUTED: ${targetSide} ${filledSize} @ $${price.toFixed(3)} | ` +
           `Cost=$${actualTotalCost.toFixed(4)} | PnL at settlement`
@@ -336,7 +338,7 @@ export class Trader {
 
       // Record the trade
       const tradeRecord: TradeRecord = {
-        id: trade.orderId ?? `trade-${Date.now()}`,
+        id: tradeRecordId,
         timestamp: Date.now(),
         marketSlug: opportunity.market.slug,
         side: opportunity.exchangeSignal as "UP" | "DOWN",
@@ -402,6 +404,7 @@ export class Trader {
       actualTotalCost,
       actualProfit,
       fullyExecuted: yesTrade.success && noTrade.success,
+      settled: true,
     };
 
     if (execution.fullyExecuted) {

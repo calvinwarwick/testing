@@ -1,55 +1,48 @@
-# Polymarket 5-Minute Crypto Arbitrage Bot
+# Polymarket 5-Minute BTC Directional Edge Bot
 
-An arbitrage bot that exploits price delays between crypto exchanges (Binance) and Polymarket's 5-minute BTC prediction markets. When the combined cost of YES + NO tokens is less than $1.00, the bot buys both sides to lock in guaranteed profit.
+This bot is focused on a single strategy: **Directional Edge** on Polymarket BTC 5-minute markets.
 
-## How It Works
+It compares fast exchange BTC movement to Polymarket YES/NO pricing and enters only when the observed edge is strong enough.
 
-### The Arbitrage
+## Strategy Focus: Directional Edge
 
-Polymarket's 5-minute crypto markets are binary markets — they resolve to either YES ($1.00) or NO ($1.00). Together, one YES + one NO token is always worth exactly $1.00 after resolution.
+Polymarket 5-minute BTC markets resolve to either:
+- **UP / YES wins** if BTC ends above the window start reference
+- **DOWN / NO wins** if BTC ends below the window start reference
 
-```
-If YES costs $0.48 and NO costs $0.48:
-  Total cost = $0.96
-  Guaranteed payout = $1.00
-  Profit = $0.04 per share pair (4.17%)
-```
+The bot:
+1. Captures BTC reference at window start
+2. Tracks live exchange BTC price
+3. Reads Polymarket YES/NO order books
+4. Computes directional edge
+5. Buys the single side (YES or NO) when thresholds pass
 
-### The Price Delay
+This repository is documented and tuned around directional execution only.
 
-Crypto exchanges (Binance) update BTC prices in **milliseconds** via WebSocket feeds. Polymarket markets depend on oracle networks (Chainlink/UMA) which update in **seconds to minutes**. During this delay window, market makers on Polymarket may not have adjusted their quotes, creating temporary mispricings where both sides are cheap.
-
-### Architecture
+## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────────┐
 │  Binance WS     │────▶│  Exchange Feed        │
 │  (BTC/USDT)     │     │  (real-time price)    │
-└─────────────────┘     └──────────┬───────────-┘
+└─────────────────┘     └──────────┬────────────┘
                                    │
-                        ┌──────────▼───────────-┐
-                        │  Arbitrage Detector    │
-                        │  • Pure arb (Y+N<$1)   │
-                        │  • Directional edge    │
-                        └──────────┬───────────-┘
+┌─────────────────┐     ┌──────────▼────────────┐
+│  Polymarket     │────▶│  Directional Detector  │
+│  Gamma + CLOB   │     │  (edge + signal)       │
+└─────────────────┘     └──────────┬────────────┘
                                    │
-┌─────────────────┐     ┌──────────▼───────────-┐
-│  Polymarket     │────▶│  Polymarket Feed       │
-│  CLOB API       │     │  (YES/NO order books)  │
-└─────────────────┘     └──────────┬───────────-┘
-                                   │
-                        ┌──────────▼───────────-┐
+                        ┌──────────▼────────────┐
                         │  Risk Manager          │
-                        │  • Position limits     │
-                        │  • Daily loss cap      │
-                        │  • Rate limiting       │
-                        └──────────┬───────────-┘
+                        │  • position caps       │
+                        │  • spacing/rate limits │
+                        │  • stop-loss handling  │
+                        └──────────┬────────────┘
                                    │
-                        ┌──────────▼───────────-┐
+                        ┌──────────▼────────────┐
                         │  Trader                │
-                        │  • EIP-712 signing     │
-                        │  • CLOB order placement│
-                        │  • Concurrent execution│
+                        │  • directional orders  │
+                        │  • dry-run/live modes  │
                         └────────────────────────┘
 ```
 
@@ -60,17 +53,17 @@ src/
 ├── index.ts                 # Entry point
 ├── bot.ts                   # Main orchestrator (discover → monitor → detect → execute)
 ├── config.ts                # Environment config loader
-├── types.ts                 # TypeScript interfaces
+├── types.ts                 # Shared interfaces
 ├── feeds/
-│   ├── exchange-feed.ts     # Binance BTC/USDT via WebSocket + REST fallback
-│   └── polymarket-feed.ts   # Polymarket Gamma API (markets) + CLOB API (order books)
+│   ├── exchange-feed.ts     # Exchange BTC pricing feed
+│   └── polymarket-feed.ts   # Polymarket market + order book feed
 ├── arbitrage/
-│   └── detector.ts          # Arb detection: pure (Y+N<$1) and directional
+│   └── detector.ts          # Directional edge detection logic
 ├── execution/
-│   └── trader.ts            # Polymarket CLOB order placement + EIP-712 signing
+│   └── trader.ts            # Directional order execution
 └── utils/
-    ├── logger.ts            # Winston logger (console + file)
-    ├── risk.ts              # Risk management (position/loss limits, rate limiting)
+    ├── logger.ts            # Logging + persistence
+    ├── risk.ts              # Risk management
     └── time.ts              # 5-minute window helpers
 ```
 
@@ -79,108 +72,79 @@ src/
 ### Prerequisites
 
 - Node.js 18+
-- A Polygon wallet with USDC (for live trading)
-- Binance API key (read-only, for price feeds)
+- Binance market data access (public WS is enough)
+- Polygon wallet + USDC only if using live order placement
 
-### Installation
+### Install
 
 ```bash
 npm install
-```
-
-### Configuration
-
-Copy the example env and fill in your keys:
-
-```bash
 cp .env.example .env
 ```
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `POLYGON_PRIVATE_KEY` | Wallet private key for Polymarket | Yes (live mode) |
-| `POLYGON_RPC_URL` | Polygon RPC endpoint | No (defaults to polygon-rpc.com) |
-| `BINANCE_API_KEY` | Binance API key (read-only) | No (WebSocket is public) |
-| `MIN_PROFIT_THRESHOLD_CENTS` | Minimum profit in cents to trigger trade | No (default: 2) |
-| `MAX_POSITION_SIZE_USDC` | Max USDC per trade | No (default: 100) |
-| `POLL_INTERVAL_MS` | Price polling interval | No (default: 1000) |
-| `DRY_RUN` | Paper trading mode | No (default: true) |
-| `FORCE_REAL_DATA` | Require live Polymarket data and refuse simulation fallback | No (default: false) |
+## Core Configuration
+
+Directional behavior is controlled primarily by:
+
+- `DIRECTIONAL_ONLY=true`
+- `MIN_EDGE_PERCENT`
+- `EXCHANGE_SIGNAL_THRESHOLD_PERCENT`
+- `MIN_EXCHANGE_MOVE_PERCENT`
+- `MIN_SECONDS_REMAINING_IN_WINDOW`
+- `MAX_POSITION_SIZE_USDC`
+- `MAX_OPEN_POSITIONS`
+- `MIN_TIME_BETWEEN_TRADES_MS`
+
+Data mode controls:
+
+- `DRY_RUN=true|false`
+- `FORCE_REAL_DATA=true|false`
+- `SIMULATE_MARKETS=false` (recommended for realistic testing)
 
 ## Usage
 
-### Dry Run (Paper Trading)
+### Recommended: Live Data + Demo Trading
 
 ```bash
-# Monitors prices and logs opportunities without placing real orders
-DRY_RUN=true npm run dev
-```
-
-### Live Data + Demo Trading (recommended test mode)
-
-```bash
-# Uses live exchange + Polymarket data but keeps execution in paper mode
 DRY_RUN=true FORCE_REAL_DATA=true npm run dev
 ```
-
-Make sure `SIMULATE_MARKETS` is unset/false in this mode.
 
 ### Live Trading
 
 ```bash
-# Places real orders — requires funded wallet and allowances set
-DRY_RUN=false npm run dev
+DRY_RUN=false FORCE_REAL_DATA=true npm run dev
 ```
 
 ### Dashboard
 
-The bot streams state and logs to a WebSocket server (port 8765 by default). To view the dashboard:
+Run the dashboard alongside the bot:
 
-1. **Start the bot** (in one terminal):
-   ```bash
-   npm run dev
-   ```
-   You should see: `Dashboard WebSocket server listening on ws://localhost:8765`
+```bash
+npm run dashboard
+```
 
-2. **Start the dashboard UI** (in another terminal):
-   ```bash
-   npm run dashboard
-   ```
-   Then open **http://localhost:5173** in your browser.
+Open:
+- `http://localhost:5173`
 
-If the dashboard shows "Disconnected", ensure the bot is running and that `DASHBOARD_WS_PORT` is not set to `0` in `.env`. To use the dashboard from another device on your network, run the dashboard with `npm run dashboard` and open `http://<your-machine-ip>:5173`; the UI will connect to the WebSocket on the same host.
+The dashboard connects to bot WebSocket state/logs (default `ws://localhost:8765`).
 
-### Run Tests
+### Tests
 
 ```bash
 npm test
 ```
 
-## Two Trading Strategies
-
-### 1. Pure Arbitrage (Guaranteed Profit)
-
-When `YES_ask + NO_ask < $1.00`, buy both sides simultaneously. One side will pay $1.00 after resolution. This is risk-free profit.
-
-**When this happens:** Market makers haven't updated both sides of the book. During volatile moments, one side gets repriced but the other lags behind.
-
-### 2. Directional Edge (Probabilistic Profit)
-
-When exchange BTC price moves sharply but Polymarket hasn't adjusted:
-- BTC jumps on Binance → Buy YES (currently underpriced)
-- BTC drops on Binance → Buy NO (currently underpriced)
-
-**When this happens:** Oracle latency means Polymarket's implied probability lags behind the exchange by several seconds.
-
-## Risk Management
+## Risk Controls
 
 The bot enforces:
-- **Max position size**: Caps USDC per trade
-- **Max open positions**: Limits concurrent exposure
-- **Daily loss cap**: Stops trading after daily losses exceed threshold
-- **Rate limiting**: Prevents rapid-fire orders
-- **Sanity checks**: Rejects opportunities with >20% profit (likely data errors)
+
+- Max notional per trade
+- Max open positions
+- Minimum time between trades
+- Per-minute rate limiting
+- Directional entry window cutoff
+- Stop-loss exit logic
 
 ## Disclaimer
 
-This bot is for educational and research purposes. Trading on prediction markets involves financial risk. Always start with dry run mode and small position sizes. The authors are not responsible for any trading losses.
+This software is for research and educational use. Prediction market trading carries real risk. Start in dry-run mode and verify behavior before enabling live execution.
