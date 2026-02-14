@@ -1,5 +1,10 @@
 import { ArbitrageDetector } from "../src/arbitrage/detector";
-import { ExchangePrice, MarketPrices, PolymarketMarket } from "../src/types";
+import {
+  ArbitrageOpportunity,
+  ExchangePrice,
+  MarketPrices,
+  PolymarketMarket,
+} from "../src/types";
 
 function makeMockMarket(overrides?: Partial<PolymarketMarket>): PolymarketMarket {
   return {
@@ -126,6 +131,19 @@ describe("ArbitrageDetector", () => {
       // Exactly $1.00 = 0 profit, should be rejected
       expect(opp).toBeNull();
     });
+
+    it("should yield positive expected profit for pure arb (execution would be profitable)", () => {
+      const prices = makeMockPrices(0.48, 0.48);
+      const exchangePrice = makeMockExchangePrice();
+
+      const opp = detector.detectArbitrage(prices, exchangePrice);
+
+      expect(opp).not.toBeNull();
+      expect(opp!.totalCost).toBeLessThan(1);
+      expect(opp!.totalExpectedProfit).toBeGreaterThan(0);
+      const expectedFromFormula = (1 - opp!.totalCost) * opp!.suggestedSize;
+      expect(opp!.totalExpectedProfit).toBeCloseTo(expectedFromFormula, 5);
+    });
   });
 
   describe("getExchangeSignal", () => {
@@ -183,6 +201,31 @@ describe("ArbitrageDetector", () => {
       const opp = detector.detectDirectionalOpportunity(prices, exchangePrice);
 
       expect(opp).toBeNull();
+    });
+  });
+
+  describe("PnL accounting: guaranteed vs directional", () => {
+    /** Condition used in bot: only count execution profit in lifetime when totalCost < 1 (pure arb). */
+    function isGuaranteedProfit(opportunity: ArbitrageOpportunity): boolean {
+      return opportunity.totalCost < 1.0;
+    }
+
+    it("pure arb opportunity (totalCost < 1) is guaranteed profit", () => {
+      const prices = makeMockPrices(0.48, 0.48);
+      const exchangePrice = makeMockExchangePrice();
+      const opp = detector.detectArbitrage(prices, exchangePrice);
+      expect(opp).not.toBeNull();
+      expect(isGuaranteedProfit(opp!)).toBe(true);
+    });
+
+    it("directional opportunity (totalCost >= 1) is not guaranteed profit at execution", () => {
+      detector.setWindowReference(65000, Math.floor(Date.now() / 1000));
+      const prices = makeMockPrices(0.55, 0.5); // YES + NO = 1.05
+      const exchangePrice = makeMockExchangePrice(65325);
+      const opp = detector.detectDirectionalOpportunity(prices, exchangePrice);
+      expect(opp).not.toBeNull();
+      expect(opp!.totalCost).toBeGreaterThanOrEqual(1.0);
+      expect(isGuaranteedProfit(opp!)).toBe(false);
     });
   });
 });

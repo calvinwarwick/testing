@@ -147,9 +147,11 @@ export class ArbitrageDetector {
   detectDirectionalOpportunity(
     marketPrices: MarketPrices,
     exchangePrice: ExchangePrice,
-    minEdgePercent: number = 5
+    minEdgePercent: number = 10,
+    signalThresholdPercent: number = 0.03,
+    minExchangeMovePercent: number = 0.15
   ): ArbitrageOpportunity | null {
-    const signal = this.getExchangeSignal(exchangePrice.price);
+    const signal = this.getExchangeSignal(exchangePrice.price, signalThresholdPercent);
     if (signal === "NEUTRAL") return null;
 
     // If exchange says UP, the YES token should be more expensive
@@ -170,9 +172,14 @@ export class ArbitrageDetector {
         100
     );
 
+    // Only enter when the exchange move is meaningful (avoids trading on noise)
+    if (pctMove < minExchangeMovePercent) return null;
+
     // Map exchange move magnitude to estimated probability
-    // These are rough heuristics — in production you'd calibrate
-    const estimatedFairPrice = Math.min(0.95, 0.5 + pctMove * 5);
+    // Calibrated heuristic: larger moves are more likely to hold, but not 1:1
+    // A 0.1% move suggests ~55% probability; 0.5% move suggests ~70%
+    // Cap at 80% to account for mean reversion and uncertainty
+    const estimatedFairPrice = Math.min(0.80, 0.5 + pctMove * 0.4);
     const edgePercent = ((estimatedFairPrice - targetAsk) / targetAsk) * 100;
 
     if (edgePercent < minEdgePercent) return null;
@@ -187,8 +194,13 @@ export class ArbitrageDetector {
         `Edge: ${edgePercent.toFixed(1)}% | Exchange move: ${pctMove.toFixed(3)}%`
     );
 
-    // For directional, we still frame it as an opportunity but
-    // the bot orchestrator can decide whether to do pure arb or directional
+    // suggestedSize must respect total cost (we buy BOTH YES and NO), so
+    // totalCost * suggestedSize <= maxPositionUsdc
+    const suggestedSize = Math.max(
+      1,
+      Math.floor(this.maxPositionUsdc / totalCost)
+    );
+
     return {
       market: marketPrices.market,
       totalCost,
@@ -196,12 +208,11 @@ export class ArbitrageDetector {
       profitPercent: edgePercent,
       yesPrice: marketPrices.yesBestAsk,
       noPrice: marketPrices.noBestAsk,
-      suggestedSize: Math.floor(this.maxPositionUsdc / targetAsk),
-      totalExpectedProfit:
-        (estimatedFairPrice - targetAsk) *
-        Math.floor(this.maxPositionUsdc / targetAsk),
+      suggestedSize,
+      totalExpectedProfit: (estimatedFairPrice - targetAsk) * suggestedSize,
       exchangePrice,
       exchangeSignal: signal,
+      windowStartBtcPrice: this.windowReferencePrice ?? undefined,
       detectedAt: Date.now(),
     };
   }

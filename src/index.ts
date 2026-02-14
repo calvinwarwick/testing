@@ -1,6 +1,8 @@
 import { loadConfig } from "./config";
 import { PolymarketArbBot } from "./bot";
-import { logger } from "./utils/logger";
+import { logger, setDashboardLogBroadcast } from "./utils/logger";
+import { DashboardServer } from "./dashboard-server";
+import { loadSession, saveSession } from "./session-store";
 
 /**
  * Entry point for the Polymarket 5-minute crypto arbitrage bot.
@@ -19,17 +21,52 @@ import { logger } from "./utils/logger";
 async function main(): Promise<void> {
   try {
     const config = loadConfig();
-    const bot = new PolymarketArbBot(config);
+    const sessionFile = config.sessionFile ?? "data/session.json";
+    const loadedSession = loadSession(sessionFile);
+    if (loadedSession) {
+      logger.info(
+        `Restored session: lifetime PnL $${loadedSession.totalProfit.toFixed(4)}, total trades ${loadedSession.totalTradesExecuted}`
+      );
+    }
+
+    const dashboard =
+      config.dashboardWsPort && config.dashboardWsPort > 0
+        ? new DashboardServer(config.dashboardWsPort)
+        : null;
+
+    if (dashboard) {
+      dashboard.start();
+      setDashboardLogBroadcast((entry) => dashboard.broadcastLog(entry));
+    }
+
+    const bot = new PolymarketArbBot(config, dashboard, loadedSession);
 
     // Handle graceful shutdown
     const shutdown = async (signal: string) => {
       logger.info(`Received ${signal}, shutting down...`);
+      setDashboardLogBroadcast(null);
+      dashboard?.stop();
+      const snapshot = bot.getSessionSnapshot();
+      saveSession(sessionFile, snapshot);
       await bot.stop();
       process.exit(0);
     };
 
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    const PERIODIC_SAVE_MS = 5 * 60 * 1000; // 5 minutes
+    const periodicSave = setInterval(() => {
+      try {
+        saveSession(sessionFile, bot.getSessionSnapshot());
+      } catch (e) {
+        logger.warn("Periodic session save failed", { error: String(e) });
+      }
+    }, PERIODIC_SAVE_MS);
+
+    const shutdownWithCleanup = async (signal: string) => {
+      clearInterval(periodicSave);
+      await shutdown(signal);
+    };
+    process.on("SIGINT", () => shutdownWithCleanup("SIGINT"));
+    process.on("SIGTERM", () => shutdownWithCleanup("SIGTERM"));
 
     await bot.start();
   } catch (error) {

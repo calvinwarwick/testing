@@ -122,6 +122,24 @@ DRY_RUN=true npm run dev
 DRY_RUN=false npm run dev
 ```
 
+### Dashboard
+
+The bot streams state and logs to a WebSocket server (port 8765 by default). To view the dashboard:
+
+1. **Start the bot** (in one terminal):
+   ```bash
+   npm run dev
+   ```
+   You should see: `Dashboard WebSocket server listening on ws://localhost:8765`
+
+2. **Start the dashboard UI** (in another terminal):
+   ```bash
+   npm run dashboard
+   ```
+   Then open **http://localhost:5173** in your browser.
+
+If the dashboard shows "Disconnected", ensure the bot is running and that `DASHBOARD_WS_PORT` is not set to `0` in `.env`. To use the dashboard from another device on your network, run the dashboard with `npm run dashboard` and open `http://<your-machine-ip>:5173`; the UI will connect to the WebSocket on the same host.
+
 ### Run Tests
 
 ```bash

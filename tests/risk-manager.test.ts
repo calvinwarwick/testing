@@ -78,7 +78,6 @@ describe("RiskManager", () => {
   beforeEach(() => {
     risk = new RiskManager({
       maxPositionUsdc: 100,
-      maxDailyLossUsdc: 50,
       maxOpenPositions: 3,
       maxTradesPerMinute: 5,
       minTimeBetweenTradesMs: 100,
@@ -103,11 +102,19 @@ describe("RiskManager", () => {
       expect(result.reason).toContain("open positions");
     });
 
-    it("should block suspiciously high profit trades", () => {
-      const opp = makeMockOpportunity({ profitPercent: 25 });
+    it("should block suspiciously high profit trades (pure arb only)", () => {
+      // Pure arb (totalCost < 1): high profit % triggers suspicion. Default threshold is 50.
+      const opp = makeMockOpportunity({ profitPercent: 55, totalCost: 0.96 });
       const result = risk.checkTrade(opp);
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Suspicious");
+    });
+
+    it("should allow high profit percent for directional (totalCost >= 1)", () => {
+      // Directional: totalCost >= 1 — suspicious check is skipped, so high edge % is allowed
+      const opp = makeMockOpportunity({ profitPercent: 60, totalCost: 1.05 });
+      const result = risk.checkTrade(opp);
+      expect(result.allowed).toBe(true);
     });
 
     it("should block trades exceeding position size", () => {

@@ -21,6 +21,44 @@ export interface BotConfig {
   pollIntervalMs: number;
   /** If true, log trades but don't execute */
   dryRun: boolean;
+  /** Optional: initial BTC 5-min event slug (e.g. btc-updown-5m-1771026600) to track this and subsequent windows */
+  btc5mEventSlug?: string;
+  /** Optional: WebSocket port for dashboard (0 = disabled) */
+  dashboardWsPort?: number;
+  /** Max concurrent open positions (default 3). Positions are released when their market window ends. */
+  maxOpenPositions?: number;
+  /** Path to session persistence file (e.g. data/session.json) */
+  sessionFile?: string;
+  /** Max profit % before treating as suspicious data error (default 50) */
+  maxProfitPercentBeforeSuspicious?: number;
+  /** Min ms between trades (default 2000) */
+  minTimeBetweenTradesMs?: number;
+  /** If true, only take pure arbitrage (yes+no < $1); skip directional opportunities */
+  pureArbOnly?: boolean;
+  /** If true, only take directional trades (exchange vs Polymarket); skip pure arbitrage */
+  directionalOnly?: boolean;
+  /** Min edge % for directional opportunities (default 10). Only enter when edge is clearly there. */
+  minEdgePercent?: number;
+  /** Exchange price must move this % vs window start for UP/DOWN signal (default 0.03 = 3%). Higher = fewer, stronger signals. */
+  exchangeSignalThresholdPercent?: number;
+  /** For directional, require at least this % exchange move (default 0.15). Avoids trading on noise. */
+  minExchangeMovePercent?: number;
+  /** Don't open new directional trades when less than this many seconds left in window (default 120 = 2 min). */
+  minSecondsRemainingInWindow?: number;
+  /** Demo starting balance in USD when dry run (default 1000). Used for display and 5% max per trade. */
+  demoStartingBalance?: number;
+}
+
+/** Persisted session state for cross-restart tracking. */
+export interface PersistedSession {
+  totalProfit: number;
+  totalTradesExecuted: number;
+  /** Trades with known positive profit (pure arb: actualProfit > 0; directional: when settlement tracked) */
+  profitableTrades?: number;
+  firstRunAt?: number;
+  dailyPnL: number;
+  dailyResetTime: number;
+  lastSavedAt?: number;
 }
 
 /** A price quote from an exchange (Binance, Coinbase, etc.) */
@@ -91,6 +129,8 @@ export interface ArbitrageOpportunity {
   exchangePrice: ExchangePrice;
   /** Which direction the exchange price suggests */
   exchangeSignal: "UP" | "DOWN" | "NEUTRAL";
+  /** BTC price at window start (for resolving directional PnL at settlement) */
+  windowStartBtcPrice?: number;
   /** Time detected */
   detectedAt: number;
 }

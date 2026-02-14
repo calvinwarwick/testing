@@ -234,6 +234,60 @@ export class Trader {
   }
 
   /**
+   * Execute a directional trade: buy only the side we're betting on (YES if UP, NO if DOWN).
+   * For directional, buying both sides would cost > $1 and guarantee a loss. We buy one side only.
+   */
+  async executeDirectional(
+    opportunity: ArbitrageOpportunity
+  ): Promise<ArbitrageExecution> {
+    const isUp = opportunity.exchangeSignal === "UP";
+    const targetSide = isUp ? "YES" : "NO";
+    const tokenId = isUp ? opportunity.market.yesTokenId : opportunity.market.noTokenId;
+    const price = isUp ? opportunity.yesPrice : opportunity.noPrice;
+    const size = Math.max(
+      1,
+      Math.floor(this.config.maxPositionSizeUsdc / price)
+    );
+
+    logger.info(
+      `Executing DIRECTIONAL ${targetSide} on ${opportunity.market.slug}: ` +
+        `${size} shares @ $${price.toFixed(3)} (bet: BTC ${opportunity.exchangeSignal})`
+    );
+
+    const trade = await this.placeLimitBuy(tokenId, price, size, targetSide);
+    const filledSize = trade.filledSize ?? 0;
+    const actualTotalCost = trade.price * filledSize;
+    const dummyResult: TradeResult = {
+      success: false,
+      side: isUp ? "NO" : "YES",
+      price: 0,
+      size: 0,
+      timestamp: Date.now(),
+    };
+
+    // Actual PnL is only known at settlement (one side pays $1). Until then we report 0.
+    const execution: ArbitrageExecution = {
+      opportunity,
+      yesTrade: isUp ? trade : dummyResult,
+      noTrade: isUp ? dummyResult : trade,
+      actualTotalCost,
+      actualProfit: 0,
+      fullyExecuted: trade.success,
+    };
+
+    if (execution.fullyExecuted) {
+      logger.info(
+        `DIRECTIONAL EXECUTED: ${targetSide} ${filledSize} @ $${price.toFixed(3)} | ` +
+          `Cost=$${actualTotalCost.toFixed(4)} | PnL at settlement`
+      );
+    } else {
+      logger.warn(`DIRECTIONAL FAILED: ${targetSide} order did not fill`);
+    }
+
+    return execution;
+  }
+
+  /**
    * Execute a full arbitrage: buy both YES and NO simultaneously.
    *
    * We buy both sides at their respective ask prices.
@@ -248,7 +302,6 @@ export class Trader {
         `${opportunity.suggestedSize} pairs @ $${opportunity.totalCost.toFixed(3)}`
     );
 
-    // Place both orders concurrently for speed
     const [yesTrade, noTrade] = await Promise.all([
       this.placeLimitBuy(
         opportunity.market.yesTokenId,

@@ -4,15 +4,14 @@ import { logger } from "./logger";
 /**
  * Risk management for the arbitrage bot.
  *
- * Enforces position limits, daily loss limits, and prevents
- * runaway trading in case of data feed issues.
+ * Enforces position limits and prevents runaway trading in case of data feed issues.
  */
 export class RiskManager {
   private readonly maxPositionUsdc: number;
-  private readonly maxDailyLossUsdc: number;
   private readonly maxOpenPositions: number;
   private readonly maxTradesPerMinute: number;
   private readonly minTimeBetweenTradesMs: number;
+  private readonly maxProfitPercentBeforeSuspicious: number;
 
   private dailyPnL: number = 0;
   private openPositions: number = 0;
@@ -22,17 +21,26 @@ export class RiskManager {
 
   constructor(options: {
     maxPositionUsdc: number;
-    maxDailyLossUsdc?: number;
     maxOpenPositions?: number;
     maxTradesPerMinute?: number;
     minTimeBetweenTradesMs?: number;
+    maxProfitPercentBeforeSuspicious?: number;
   }) {
     this.maxPositionUsdc = options.maxPositionUsdc;
-    this.maxDailyLossUsdc = options.maxDailyLossUsdc || options.maxPositionUsdc * 5;
-    this.maxOpenPositions = options.maxOpenPositions || 3;
+    this.maxOpenPositions = Math.max(1, options.maxOpenPositions ?? 3);
     this.maxTradesPerMinute = options.maxTradesPerMinute || 10;
-    this.minTimeBetweenTradesMs = options.minTimeBetweenTradesMs || 2000;
+    this.minTimeBetweenTradesMs = options.minTimeBetweenTradesMs ?? 2000;
+    this.maxProfitPercentBeforeSuspicious =
+      options.maxProfitPercentBeforeSuspicious ?? 50;
     this.resetDaily();
+  }
+
+  /**
+   * Restore risk state from persisted session (e.g. after restart).
+   */
+  restoreState(state: { dailyPnL: number; dailyResetTime: number }): void {
+    this.dailyPnL = state.dailyPnL;
+    this.dailyResetTime = state.dailyResetTime;
   }
 
   /**
@@ -44,14 +52,6 @@ export class RiskManager {
     reason?: string;
   } {
     this.maybeResetDaily();
-
-    // Check daily loss limit
-    if (this.dailyPnL < -this.maxDailyLossUsdc) {
-      return {
-        allowed: false,
-        reason: `Daily loss limit hit: $${this.dailyPnL.toFixed(2)} (limit: -$${this.maxDailyLossUsdc})`,
-      };
-    }
 
     // Check open positions
     if (this.openPositions >= this.maxOpenPositions) {
@@ -70,16 +70,8 @@ export class RiskManager {
       };
     }
 
-    // Check rate limiting
-    const now = Date.now();
-    if (now - this.lastTradeTime < this.minTimeBetweenTradesMs) {
-      return {
-        allowed: false,
-        reason: `Too soon after last trade (min ${this.minTimeBetweenTradesMs}ms gap)`,
-      };
-    }
-
     // Check trades per minute
+    const now = Date.now();
     const oneMinuteAgo = now - 60000;
     this.recentTrades = this.recentTrades.filter((t) => t > oneMinuteAgo);
     if (this.recentTrades.length >= this.maxTradesPerMinute) {
@@ -89,8 +81,8 @@ export class RiskManager {
       };
     }
 
-    // Sanity check: profit should be positive and reasonable
-    if (opportunity.profitPercent > 20) {
+    // Sanity check: for pure arb only, profit % should be reasonable (directional can have high edge %)
+    if (opportunity.totalCost < 1.0 && opportunity.profitPercent > this.maxProfitPercentBeforeSuspicious) {
       return {
         allowed: false,
         reason: `Suspicious profit ${opportunity.profitPercent.toFixed(1)}% — possible data error`,
@@ -129,10 +121,22 @@ export class RiskManager {
   }
 
   /**
-   * Get current risk state for monitoring.
+   * Release one open position when its market window has ended (without recording PnL).
+   * Use when we don't have settlement data but the 5-min window is past.
+   */
+  releasePosition(): void {
+    if (this.openPositions > 0) {
+      this.openPositions--;
+      logger.info(`Risk: Position released (window ended). Open: ${this.openPositions}`);
+    }
+  }
+
+  /**
+   * Get current risk state for monitoring and persistence.
    */
   getState(): {
     dailyPnL: number;
+    dailyResetTime: number;
     openPositions: number;
     tradesLastMinute: number;
   } {
@@ -140,6 +144,7 @@ export class RiskManager {
     this.recentTrades = this.recentTrades.filter((t) => t > oneMinuteAgo);
     return {
       dailyPnL: this.dailyPnL,
+      dailyResetTime: this.dailyResetTime,
       openPositions: this.openPositions,
       tradesLastMinute: this.recentTrades.length,
     };

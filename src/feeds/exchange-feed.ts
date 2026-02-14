@@ -3,90 +3,179 @@ import axios from "axios";
 import { ExchangePrice } from "../types";
 import { logger } from "../utils/logger";
 
+const AGGREGATE_INTERVAL_MS = 2000;
+const REST_TIMEOUT_MS = 5000;
+
+type PriceEntry = { price: number; timestamp: number };
+
 /**
- * Fetches real-time BTC/USDT price from Binance.
- * Uses WebSocket for low-latency streaming with REST fallback.
- *
- * The key insight: exchange prices update faster than Polymarket's
- * oracle (Chainlink). We use the exchange price to predict the
- * 5-min candle direction before Polymarket prices adjust.
+ * Fetches real-time BTC price from multiple CEXes and aggregates (median).
+ * Uses Binance WebSocket for low-latency plus REST polling for Binance,
+ * Coinbase, OKX, Bybit, Kraken, and Bitfinex.
  */
 export class ExchangeFeed {
   private ws: WebSocket | null = null;
-  private latestPrice: ExchangePrice | null = null;
+  private prices = new Map<string, PriceEntry>();
+  private aggregated: ExchangePrice | null = null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private isRunning = false;
+  private restInterval: ReturnType<typeof setInterval> | null = null;
 
   private readonly binanceWsUrl =
     "wss://stream.binance.com:9443/ws/btcusdt@ticker";
   private readonly binanceRestUrl =
     "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT";
 
-  /**
-   * Start the price feed. Connects via WebSocket with REST fallback.
-   */
+  private static readonly REST_SOURCES: Array<{
+    name: string;
+    url: string;
+    parse: (data: unknown) => number | null;
+  }> = [
+    {
+      name: "binance",
+      url: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+      parse: (d) =>
+        typeof (d as { price?: string }).price === "string"
+          ? parseFloat((d as { price: string }).price)
+          : null,
+    },
+    {
+      name: "coinbase",
+      url: "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+      parse: (d) => {
+        const data = (d as { data?: { amount?: string } }).data;
+        return data?.amount != null ? parseFloat(data.amount) : null;
+      },
+    },
+    {
+      name: "okx",
+      url: "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT",
+      parse: (d) => {
+        const arr = (d as { data?: Array<{ last?: string }> }).data;
+        const last = arr?.[0]?.last;
+        return last != null ? parseFloat(last) : null;
+      },
+    },
+    {
+      name: "bybit",
+      url: "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT",
+      parse: (d) => {
+        const list = (d as { result?: { list?: Array<{ lastPrice?: string }> } })
+          .result?.list;
+        const last = list?.[0]?.lastPrice;
+        return last != null ? parseFloat(last) : null;
+      },
+    },
+    {
+      name: "kraken",
+      url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+      parse: (d) => {
+        const result = (d as { result?: Record<string, { c?: string[] }> })
+          .result;
+        const pair = result?.XXBTZUSD ?? result?.XBTCUSD;
+        const c = pair?.c;
+        return c?.[0] != null ? parseFloat(c[0]) : null;
+      },
+    },
+    {
+      name: "bitfinex",
+      url: "https://api-pub.bitfinex.com/v2/ticker/tBTCUSD",
+      parse: (d) => {
+        const arr = d as number[];
+        return Array.isArray(arr) && typeof arr[6] === "number" ? arr[6] : null;
+      },
+    },
+  ];
+
   async start(): Promise<void> {
     this.isRunning = true;
-    logger.info("Starting exchange price feed (Binance BTC/USDT)");
+    logger.info(
+      "Starting exchange price feed (Binance, Coinbase, OKX, Bybit, Kraken, Bitfinex → aggregated)"
+    );
 
-    // Fetch an initial price via REST before WebSocket connects
-    await this.fetchRestPrice();
+    await this.fetchAllRest();
+    this.recomputeAggregated();
 
-    // Then start WebSocket for real-time updates
+    this.restInterval = setInterval(() => {
+      if (!this.isRunning) return;
+      this.fetchAllRest();
+      this.recomputeAggregated();
+    }, AGGREGATE_INTERVAL_MS);
+
     this.connectWebSocket();
   }
 
-  /**
-   * Stop the price feed and close connections.
-   */
   stop(): void {
     this.isRunning = false;
+    if (this.restInterval) {
+      clearInterval(this.restInterval);
+      this.restInterval = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+    this.prices.clear();
+    this.aggregated = null;
     logger.info("Exchange price feed stopped");
   }
 
-  /**
-   * Get the latest BTC price. Returns null if no price is available yet.
-   */
   getLatestPrice(): ExchangePrice | null {
-    return this.latestPrice;
+    return this.aggregated;
   }
 
   /**
-   * Fetch the current price via REST API (fallback / initial).
+   * Get last price per exchange (for dashboard / debugging).
    */
-  async fetchRestPrice(): Promise<ExchangePrice | null> {
-    try {
-      const response = await axios.get<{ symbol: string; price: string }>(
-        this.binanceRestUrl,
-        { timeout: 5000 }
+  getPricesByExchange(): Map<string, number> {
+    const out = new Map<string, number>();
+    this.prices.forEach((e, name) => out.set(name, e.price));
+    return out;
+  }
+
+  private setPrice(exchange: string, price: number): void {
+    this.prices.set(exchange, { price, timestamp: Date.now() });
+  }
+
+  private recomputeAggregated(): void {
+    if (this.prices.size === 0) return;
+    const values = Array.from(this.prices.values()).map((e) => e.price);
+    values.sort((a, b) => a - b);
+    const mid = Math.floor(values.length / 2);
+    const median =
+      values.length % 2 !== 0
+        ? values[mid]
+        : (values[mid - 1] + values[mid]) / 2;
+    const latestTs = Math.max(
+      ...Array.from(this.prices.values()).map((e) => e.timestamp)
+    );
+    this.aggregated = {
+      exchange: "aggregated",
+      symbol: "BTCUSDT",
+      price: median,
+      timestamp: latestTs,
+    };
+  }
+
+  private async fetchAllRest(): Promise<void> {
+    const results = await Promise.allSettled(
+      ExchangeFeed.REST_SOURCES.map(async (src) => {
+        const res = await axios.get(src.url, { timeout: REST_TIMEOUT_MS });
+        const price = src.parse(res.data);
+        if (price != null && Number.isFinite(price)) {
+          this.setPrice(src.name, price);
+        }
+      })
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed > 0) {
+      logger.debug(
+        `REST feeds: ${this.prices.size}/${ExchangeFeed.REST_SOURCES.length} succeeded`
       );
-      const price: ExchangePrice = {
-        exchange: "binance",
-        symbol: "BTCUSDT",
-        price: parseFloat(response.data.price),
-        timestamp: Date.now(),
-      };
-      this.latestPrice = price;
-      logger.debug(`REST price update: $${price.price}`);
-      return price;
-    } catch (error) {
-      logger.error("Failed to fetch REST price from Binance", {
-        error: String(error),
-      });
-      return null;
     }
   }
 
-  /**
-   * Connect to Binance WebSocket for real-time ticker updates.
-   * The ticker stream gives us last price, bid/ask, and volume
-   * with sub-second latency.
-   */
   private connectWebSocket(): void {
     if (!this.isRunning) return;
 
@@ -101,12 +190,11 @@ export class ExchangeFeed {
       this.ws.on("message", (data: WebSocket.Data) => {
         try {
           const ticker = JSON.parse(data.toString());
-          this.latestPrice = {
-            exchange: "binance",
-            symbol: "BTCUSDT",
-            price: parseFloat(ticker.c), // 'c' = last price in ticker
-            timestamp: Date.now(),
-          };
+          const p = parseFloat(ticker.c);
+          if (Number.isFinite(p)) {
+            this.setPrice("binance", p);
+            this.recomputeAggregated();
+          }
         } catch {
           logger.warn("Failed to parse WebSocket ticker message");
         }
@@ -117,7 +205,7 @@ export class ExchangeFeed {
         this.scheduleReconnect();
       });
 
-      this.ws.on("error", (error) => {
+      this.ws.on("error", (error: Error) => {
         logger.error("Binance WebSocket error", { error: String(error) });
         this.ws?.close();
       });
@@ -129,36 +217,20 @@ export class ExchangeFeed {
     }
   }
 
-  /**
-   * Schedule a reconnection attempt with exponential backoff.
-   */
   private scheduleReconnect(): void {
     if (!this.isRunning) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      logger.error(
-        "Max WebSocket reconnect attempts reached, falling back to REST polling"
+      logger.warn(
+        "Max Binance WebSocket reconnects reached; continuing with REST-only aggregation"
       );
-      this.startRestPolling();
       return;
     }
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
     logger.info(
-      `Reconnecting WebSocket in ${delay}ms (attempt ${this.reconnectAttempts})`
+      `Reconnecting Binance WebSocket in ${delay}ms (attempt ${this.reconnectAttempts})`
     );
     setTimeout(() => this.connectWebSocket(), delay);
-  }
-
-  /**
-   * Fall back to REST polling if WebSocket is unavailable.
-   */
-  private startRestPolling(): void {
-    const poll = async () => {
-      if (!this.isRunning) return;
-      await this.fetchRestPrice();
-      setTimeout(poll, 1000);
-    };
-    poll();
   }
 }
