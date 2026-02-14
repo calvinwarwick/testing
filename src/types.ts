@@ -47,6 +47,8 @@ export interface BotConfig {
   minSecondsRemainingInWindow?: number;
   /** Demo starting balance in USD when dry run (default 1000). Used for display and 5% max per trade. */
   demoStartingBalance?: number;
+  /** If true, refuse simulation fallback and require live Polymarket market data. */
+  forceRealData?: boolean;
 }
 
 /** Persisted session state for cross-restart tracking. */
@@ -87,6 +89,10 @@ export interface PolymarketMarket {
   endTime: number;
   /** Whether the market is currently active/tradeable */
   active: boolean;
+  /** Optional market traded volume in USD (from Gamma metadata). */
+  volumeUsd?: number;
+  /** Optional market liquidity in USD (from Gamma metadata). */
+  liquidityUsd?: number;
 }
 
 /** Price snapshot for a Polymarket binary market */
@@ -94,8 +100,12 @@ export interface MarketPrices {
   market: PolymarketMarket;
   /** Best ask price for YES token (cost to buy YES) */
   yesBestAsk: number;
+  /** Size available at best YES ask */
+  yesBestAskSize?: number;
   /** Best ask price for NO token (cost to buy NO) */
   noBestAsk: number;
+  /** Size available at best NO ask */
+  noBestAskSize?: number;
   /** Best bid for YES (what you can sell YES for) */
   yesBestBid: number;
   /** Best bid for NO (what you can sell NO for) */
@@ -158,6 +168,8 @@ export interface ArbitrageExecution {
   actualProfit: number;
   /** Whether both sides filled successfully */
   fullyExecuted: boolean;
+  /** Set when a directional loss was capped by stop-loss (dashboard can show "capped") */
+  lossCapped?: boolean;
 }
 
 /** Order book level */
@@ -176,3 +188,23 @@ export interface OrderBook {
 
 /** Direction signal based on exchange price vs market reference */
 export type PriceDirection = "UP" | "DOWN" | "NEUTRAL";
+
+/** Trade record for persistent logging */
+export interface TradeRecord {
+  id: string;
+  timestamp: number;
+  marketSlug: string;
+  side: "UP" | "DOWN";
+  type: "directional" | "arbitrage";
+  entryPrice: number;
+  size: number;
+  cost: number;
+  settled: boolean;
+  settledAt?: number;
+  profit?: number;
+  outcome?: "win" | "loss";
+  marketWindowStart: number;
+  marketWindowEnd: number;
+  btcPriceAtEntry: number;
+  btcPriceAtSettlement?: number;
+}

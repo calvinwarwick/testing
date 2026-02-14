@@ -6,18 +6,40 @@ const WS_URL =
   (typeof window !== "undefined"
     ? `ws://${window.location.hostname}:${WS_PORT}`
     : `ws://localhost:${WS_PORT}`);
-const MAX_LOGS = 500;
-const MAX_CHART_POINTS = 120;
+const MAX_LOGS = 1000;
+const FIVE_MIN_MS = 5 * 60 * 1000;
+const MAX_BTC_POINTS_5M = 60; // ~1 point per 5s over 5m
+
+export interface HistoricalMarket {
+  windowStart: number;
+  windowEnd: number;
+  btcPriceAtStart: number;
+  btcPriceAtEnd: number;
+  outcome: "UP" | "DOWN";
+  recordedAt: number;
+}
 
 export interface BotState {
   btcPrice: number | null;
   btcTimestamp: number;
   cexPrices: Record<string, number>;
+  /** Current 5-min market UP (YES) and DOWN (NO) best ask prices (0–1) */
+  currentMarketPrices?: { up: number; down: number };
+  /** Current market data source mode. */
+  dataMode?: "live" | "simulation";
+  /** Reason behind current data mode. */
+  modeReason?: string;
+  /** Whether FORCE_REAL_DATA is enabled in config. */
+  forceRealData?: boolean;
+  /** Market volume (USD) for current window, when available */
+  marketVolume?: number;
   activeMarketsCount: number;
   activeMarketSlugs: string[];
   windowStartTime: number;
   windowEndTime: number;
   windowRemainingSec: number;
+  /** BTC price at current window start (when available) */
+  windowStartBtcPrice?: number;
   risk: {
     dailyPnL: number;
     openPositions: number;
@@ -29,9 +51,13 @@ export interface BotState {
     tradesExecuted: number;
     totalProfit: number;
     startTime: number;
+    /** Lifetime count of trades that ended with profit > 0 (for win rate %) */
+    profitableTrades?: number;
   };
   demoBalance?: { startingUsd: number; currentUsd: number };
   mode: "dry_run" | "live";
+  /** Recent persisted logs to hydrate initial dashboard view. */
+  recentLogs?: LogEntry[];
   executions: Array<{
     marketSlug: string;
     actualProfit: number;
@@ -44,7 +70,10 @@ export interface BotState {
     marketWindowStart: number;
     marketWindowEnd: number;
     unrealizedProfit: number | null;
+    lossCapped?: boolean;
   }>;
+  /** Historical markets from persistent storage */
+  historicalMarkets?: HistoricalMarket[];
 }
 
 export interface LogEntry {
@@ -64,7 +93,6 @@ export function useBotConnection() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttempts = useRef(0);
-  const tickRef = useRef(0);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -83,18 +111,22 @@ export function useBotConnection() {
         if (msg.type === "state") {
           const s = msg.payload as BotState;
           setState(s);
-          tickRef.current += 1;
-          const t = tickRef.current;
+          if (Array.isArray(s.recentLogs) && s.recentLogs.length > 0) {
+            setLogs((prev) => (prev.length > 0 ? prev : s.recentLogs!));
+          }
           if (s.stats.totalProfit !== undefined) {
             setPnlHistory((prev) => {
-              const next = [...prev, { t, v: s.stats.totalProfit }];
-              return next.length > MAX_CHART_POINTS ? next.slice(-MAX_CHART_POINTS) : next;
+              const next = [...prev, { t: Date.now(), v: s.stats.totalProfit }];
+              return next; // keep all time for PNL chart
             });
           }
           if (s.btcPrice != null) {
             setBtcHistory((prev) => {
-              const next = [...prev, { t, v: s.btcPrice! }];
-              return next.length > MAX_CHART_POINTS ? next.slice(-MAX_CHART_POINTS) : next;
+              const now = Date.now();
+              const next = [...prev, { t: now, v: s.btcPrice! }];
+              const cutoff = now - FIVE_MIN_MS;
+              const filtered = next.filter((pt) => pt.t >= cutoff);
+              return filtered.length > MAX_BTC_POINTS_5M ? filtered.slice(-MAX_BTC_POINTS_5M) : filtered;
             });
           }
         } else if (msg.type === "log") {

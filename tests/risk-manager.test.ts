@@ -124,6 +124,13 @@ describe("RiskManager", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Trade size");
     });
+
+    it("should enforce minimum time between trades", () => {
+      risk.recordExecution(makeMockExecution());
+      const result = risk.checkTrade(makeMockOpportunity());
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Min time between trades");
+    });
   });
 
   describe("recordSettlement", () => {

@@ -27,6 +27,16 @@ interface GammaMarket {
   end_date_iso?: string;
   active?: boolean;
   enableOrderBook?: boolean;
+  volume?: number | string;
+  volumeNum?: number | string;
+  volume_24hr?: number | string;
+  volume24hr?: number | string;
+  liquidity?: number | string;
+  liquidityNum?: number | string;
+  closed?: boolean;
+  outcomes?: string[] | string;
+  outcomePrices?: string[] | string;
+  winner?: string | null;
 }
 
 /**
@@ -43,19 +53,29 @@ export class PolymarketFeed {
   private readonly gammaUrl: string;
   private readonly clobUrl: string;
   private readonly btc5mEventSlug?: string;
+  private readonly forceRealData: boolean;
 
   constructor(
     gammaUrl: string,
     clobUrl: string,
-    btc5mEventSlug?: string
+    btc5mEventSlug?: string,
+    forceRealData: boolean = false
   ) {
     this.gammaUrl = gammaUrl;
     this.clobUrl = clobUrl;
     this.btc5mEventSlug = btc5mEventSlug;
+    this.forceRealData = forceRealData;
+    this.simulationMode =
+      process.env.SIMULATE_MARKETS === "true" && !this.forceRealData;
+    this.modeReason = this.simulationMode
+      ? "env_simulate_markets"
+      : "live_markets";
   }
 
   /** Simulation mode flag - set to true when no real markets found or SIMULATE_MARKETS=true */
-  private simulationMode = process.env.SIMULATE_MARKETS === "true";
+  private simulationMode = false;
+  /** Human-readable reason for current mode (for logs/dashboard) */
+  private modeReason = "live_markets";
   /** Track consecutive order book failures to auto-enable simulation */
   private orderBookFailures = 0;
   /** Simulated market prices (updated each cycle for realism) */
@@ -70,24 +90,47 @@ export class PolymarketFeed {
   async findActiveCryptoMarkets(
     asset: string = "BTC"
   ): Promise<PolymarketMarket[]> {
+    if (this.forceRealData && process.env.SIMULATE_MARKETS === "true") {
+      logger.warn(
+        "FORCE_REAL_DATA=true: ignoring SIMULATE_MARKETS=true and requiring live markets"
+      );
+    }
     // If SIMULATE_MARKETS is set, always use simulation
-    if (process.env.SIMULATE_MARKETS === "true") {
-      this.simulationMode = true;
+    if (!this.forceRealData && process.env.SIMULATE_MARKETS === "true") {
+      this.setMode(
+        true,
+        "env_simulate_markets",
+        "SIMULATION MODE forced by SIMULATE_MARKETS=true"
+      );
       return this.generateSimulatedMarkets();
     }
 
     const markets = await this.findBtc5MinMarketsBySlugs();
     if (markets.length > 0) {
-      this.simulationMode = false;
+      this.setMode(false, "live_markets");
       return markets;
     }
     const legacyMarkets = await this.findBtc5MinMarketsLegacy(asset);
     if (legacyMarkets.length > 0) {
-      this.simulationMode = false;
+      this.setMode(false, "live_markets_legacy");
       return legacyMarkets;
     }
+
+    if (this.forceRealData) {
+      this.setMode(
+        false,
+        "force_real_data_no_markets",
+        "FORCE_REAL_DATA=true and no live markets discovered; refusing simulation fallback"
+      );
+      return [];
+    }
+
     // No real markets found - switch to simulation mode
-    this.simulationMode = true;
+    this.setMode(
+      true,
+      "no_live_markets_found",
+      "No live BTC 5-min markets found; falling back to simulation mode"
+    );
     return this.generateSimulatedMarkets();
   }
 
@@ -120,6 +163,82 @@ export class PolymarketFeed {
       logger.info(`SIMULATION MODE: Generated ${markets.length} simulated BTC 5-min markets`);
     }
     return markets;
+  }
+
+  /**
+   * Fetch most recent resolved BTC 5-min markets directly from Polymarket.
+   * Uses prior window slugs and resolves outcome from outcomePrices.
+   */
+  async getRecentResolvedBtcMarkets(limit: number = 10): Promise<
+    Array<{
+      windowStart: number;
+      windowEnd: number;
+      outcome: "UP" | "DOWN";
+      recordedAt: number;
+      btcPriceAtStart: number;
+      btcPriceAtEnd: number;
+    }>
+  > {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const FIVE_MIN = 300;
+    // Start from the PREVIOUS 5-min boundary; current boundary may still be unresolved.
+    const latestResolvedEnd = Math.floor(nowSec / FIVE_MIN) * FIVE_MIN - FIVE_MIN;
+    const lookback = Math.max(limit * 3, 30);
+    const slugs: string[] = [];
+    for (let i = 0; i < lookback; i++) {
+      slugs.push(`btc-updown-5m-${latestResolvedEnd - i * FIVE_MIN}`);
+    }
+
+    const requests = slugs.map((slug) =>
+      axios
+        .get<GammaEvent[]>(`${this.gammaUrl}/events`, {
+          params: { slug, limit: "5" },
+          timeout: 8000,
+        })
+        .then((r) => ({ slug, events: Array.isArray(r.data) ? r.data : [] }))
+        .catch(() => ({ slug, events: [] as GammaEvent[] }))
+    );
+    const responses = await Promise.all(requests);
+    const out: Array<{
+      windowStart: number;
+      windowEnd: number;
+      outcome: "UP" | "DOWN";
+      recordedAt: number;
+      btcPriceAtStart: number;
+      btcPriceAtEnd: number;
+    }> = [];
+    const seen = new Set<number>();
+
+    for (const res of responses) {
+      if (out.length >= limit) break;
+      const event = res.events[0];
+      const market =
+        event?.markets?.find((m) => m.slug === res.slug) ??
+        event?.markets?.find((m) => (m.slug ?? "").startsWith("btc-updown-5m-")) ??
+        event?.markets?.[0];
+      if (!market) continue;
+      const slug = market.slug || event.slug || res.slug;
+      if (!slug.startsWith("btc-updown-5m-")) continue;
+      const windowStart = this.parseSlugTimestamp(slug);
+      if (!windowStart || seen.has(windowStart) || windowStart > nowSec) continue;
+      if (market.closed !== true) continue;
+      // BTC up/down strategy windows are always 5 minutes; slug timestamp is the window START.
+      const normalizedStart = windowStart;
+      const normalizedEnd = windowStart + FIVE_MIN;
+      const outcome = this.resolveUpDownOutcome(market);
+      if (!outcome) continue;
+      seen.add(normalizedStart);
+      out.push({
+        windowStart: normalizedStart,
+        windowEnd: normalizedEnd,
+        outcome,
+        recordedAt: Date.now(),
+        btcPriceAtStart: 0,
+        btcPriceAtEnd: 0,
+      });
+    }
+
+    return out.sort((a, b) => b.windowEnd - a.windowEnd).slice(0, limit);
   }
 
   /**
@@ -224,6 +343,14 @@ export class PolymarketFeed {
             : 0,
           endTime,
           active: m.active !== false,
+          volumeUsd:
+            this.parseNumberLike(m.volumeNum) ??
+            this.parseNumberLike(m.volume) ??
+            this.parseNumberLike(m.volume24hr) ??
+            this.parseNumberLike(m.volume_24hr),
+          liquidityUsd:
+            this.parseNumberLike(m.liquidityNum) ??
+            this.parseNumberLike(m.liquidity),
         });
       }
     }
@@ -241,6 +368,15 @@ export class PolymarketFeed {
     } catch {
       return [];
     }
+  }
+
+  private parseNumberLike(v: unknown): number | undefined {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : undefined;
+    }
+    return undefined;
   }
 
   /**
@@ -288,6 +424,14 @@ export class PolymarketFeed {
             new Date(m.endDate || m.end_date_iso).getTime() / 1000
           ),
           active: m.active !== false,
+          volumeUsd:
+            this.parseNumberLike((m as { volumeNum?: unknown }).volumeNum) ??
+            this.parseNumberLike((m as { volume?: unknown }).volume) ??
+            this.parseNumberLike((m as { volume24hr?: unknown }).volume24hr) ??
+            this.parseNumberLike((m as { volume_24hr?: unknown }).volume_24hr),
+          liquidityUsd:
+            this.parseNumberLike((m as { liquidityNum?: unknown }).liquidityNum) ??
+            this.parseNumberLike((m as { liquidity?: unknown }).liquidity),
         });
       }
 
@@ -362,8 +506,17 @@ export class PolymarketFeed {
         this.orderBookFailures++;
         // After 5 consecutive failures, auto-enable simulation mode
         if (this.orderBookFailures >= 5 && !this.simulationMode) {
-          logger.warn(`Order books unavailable - switching to SIMULATION MODE`);
-          this.simulationMode = true;
+          if (this.forceRealData) {
+            logger.error(
+              "FORCE_REAL_DATA=true and order books unavailable after 5 failures; refusing simulation fallback"
+            );
+            return null;
+          }
+          this.setMode(
+            true,
+            "orderbook_failures",
+            "Order books unavailable - switching to SIMULATION MODE"
+          );
           return this.getSimulatedMarketPrices(market, currentBtcPrice, windowStartBtcPrice);
         }
         logger.debug(`Missing order book data for market ${market.slug} (failure ${this.orderBookFailures}/5)`);
@@ -375,15 +528,23 @@ export class PolymarketFeed {
 
       // Best ask = lowest price someone is willing to sell at (cost to buy)
       // Best bid = highest price someone is willing to buy at (what we can sell for)
+      const yesBestAskLevel = yesBook.asks.length > 0
+        ? yesBook.asks.reduce((min, a) => (a.price < min.price ? a : min))
+        : null;
       const yesBestAsk = yesBook.asks.length > 0
         ? Math.min(...yesBook.asks.map((a) => a.price))
         : 1.0;
+      const yesBestAskSize = yesBestAskLevel?.size;
       const yesBestBid = yesBook.bids.length > 0
         ? Math.max(...yesBook.bids.map((b) => b.price))
         : 0.0;
+      const noBestAskLevel = noBook.asks.length > 0
+        ? noBook.asks.reduce((min, a) => (a.price < min.price ? a : min))
+        : null;
       const noBestAsk = noBook.asks.length > 0
         ? Math.min(...noBook.asks.map((a) => a.price))
         : 1.0;
+      const noBestAskSize = noBestAskLevel?.size;
       const noBestBid = noBook.bids.length > 0
         ? Math.max(...noBook.bids.map((b) => b.price))
         : 0.0;
@@ -391,7 +552,9 @@ export class PolymarketFeed {
       return {
         market,
         yesBestAsk,
+        yesBestAskSize,
         noBestAsk,
+        noBestAskSize,
         yesBestBid,
         noBestBid,
         yesMid: (yesBestAsk + yesBestBid) / 2,
@@ -454,7 +617,9 @@ export class PolymarketFeed {
     return {
       market,
       yesBestAsk: yesAsk,
+      yesBestAskSize: 1000,
       noBestAsk: noAsk,
+      noBestAskSize: 1000,
       yesBestBid: yesAsk - 0.01,
       noBestBid: noAsk - 0.01,
       yesMid: yesAsk - 0.005,
@@ -466,6 +631,75 @@ export class PolymarketFeed {
   /** Check if currently in simulation mode */
   isSimulating(): boolean {
     return this.simulationMode;
+  }
+
+  /** Get current market data mode for status surfaces (dashboard/logging). */
+  getDataMode(): "simulation" | "live" {
+    return this.simulationMode ? "simulation" : "live";
+  }
+
+  /** Get reason for current data mode. */
+  getModeReason(): string {
+    return this.modeReason;
+  }
+
+  private setMode(
+    simulation: boolean,
+    reason: string,
+    transitionLog?: string
+  ): void {
+    const changed = this.simulationMode !== simulation;
+    this.simulationMode = simulation;
+    this.modeReason = reason;
+    if (changed && transitionLog) {
+      logger.warn(transitionLog);
+    }
+  }
+
+  private parseStringArray(v: unknown): string[] {
+    if (Array.isArray(v)) {
+      return v.map((x) => String(x));
+    }
+    if (typeof v === "string") {
+      try {
+        const parsed = JSON.parse(v);
+        if (Array.isArray(parsed)) return parsed.map((x) => String(x));
+      } catch {
+        // ignored
+      }
+    }
+    return [];
+  }
+
+  private parseSlugTimestamp(slug: string): number | null {
+    const m = slug.match(/btc-updown-5m-(\d{9,})$/);
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  private resolveUpDownOutcome(market: GammaMarket): "UP" | "DOWN" | null {
+    const outcomes = this.parseStringArray(market.outcomes);
+    const prices = this.parseStringArray(market.outcomePrices).map((p) =>
+      parseFloat(p)
+    );
+    if (outcomes.length === 0 || prices.length === 0) return null;
+
+    // Only accept final, decisive markets (e.g. 1/0). Ignore ambiguous non-resolved prices.
+    const sorted = [...prices].sort((a, b) => b - a);
+    const bestPrice = sorted[0] ?? 0;
+    const secondPrice = sorted[1] ?? 0;
+    const decisive = bestPrice >= 0.99 && secondPrice <= 0.01;
+    if (!decisive) return null;
+
+    const paired = outcomes.map((label, i) => ({
+      label: label.toLowerCase(),
+      price: prices[i] ?? 0,
+    }));
+    const best = paired.reduce((a, b) => (b.price > a.price ? b : a), paired[0]);
+    if (best.label.includes("up")) return "UP";
+    if (best.label.includes("down")) return "DOWN";
+    return null;
   }
 
   /**

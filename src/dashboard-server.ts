@@ -1,16 +1,38 @@
 import { WebSocketServer, WebSocket } from "ws";
 
+/** Historical market record */
+export interface HistoricalMarketRecord {
+  windowStart: number;
+  windowEnd: number;
+  btcPriceAtStart: number;
+  btcPriceAtEnd: number;
+  outcome: "UP" | "DOWN";
+  recordedAt: number;
+}
+
 /** State broadcast to the dashboard (serializable). */
 export interface DashboardState {
   btcPrice: number | null;
   btcTimestamp: number;
   /** Per-exchange BTC prices (binance, coinbase, okx, bybit, kraken, bitfinex) */
   cexPrices: Record<string, number>;
+  /** Current 5-min market YES (UP) and NO (DOWN) best ask prices (0–1) */
+  currentMarketPrices?: { up: number; down: number };
+  /** Current market data source mode. */
+  dataMode?: "live" | "simulation";
+  /** Reason behind current data mode. */
+  modeReason?: string;
+  /** Whether FORCE_REAL_DATA is enabled in config. */
+  forceRealData?: boolean;
+  /** Market volume (USD) for current window, when available */
+  marketVolume?: number;
   activeMarketsCount: number;
   activeMarketSlugs: string[];
   windowStartTime: number;
   windowEndTime: number;
   windowRemainingSec: number;
+  /** BTC price at current window start (when available) */
+  windowStartBtcPrice?: number;
   risk: {
     dailyPnL: number;
     openPositions: number;
@@ -22,10 +44,14 @@ export interface DashboardState {
     tradesExecuted: number;
     totalProfit: number;
     startTime: number;
+    /** Lifetime count of trades that ended with profit > 0 (for win rate %) */
+    profitableTrades?: number;
   };
   /** Demo mode: starting balance and current balance (starting + totalProfit) */
   demoBalance?: { startingUsd: number; currentUsd: number };
   mode: "dry_run" | "live";
+  /** Recent persisted logs (sent with state to hydrate dashboard on startup). */
+  recentLogs?: DashboardLogEntry[];
   executions: Array<{
     marketSlug: string;
     actualProfit: number;
@@ -39,7 +65,11 @@ export interface DashboardState {
     marketWindowEnd: number;
     /** Live mark-to-market PnL for open positions (null when settled or no price) */
     unrealizedProfit: number | null;
+    /** True when a loss was capped by stop-loss (so P/L is not the full loss) */
+    lossCapped?: boolean;
   }>;
+  /** Historical markets (last 100) */
+  historicalMarkets?: HistoricalMarketRecord[];
 }
 
 export interface DashboardLogEntry {

@@ -3,7 +3,17 @@ import { PolymarketFeed } from "./feeds/polymarket-feed";
 import { ArbitrageDetector } from "./arbitrage/detector";
 import { Trader } from "./execution/trader";
 import { RiskManager } from "./utils/risk";
-import { logger } from "./utils/logger";
+import {
+  logger,
+  loadTradeRecords,
+  getTradeRecords,
+  updateTradeSettlement,
+  loadHistoricalMarkets,
+  recordHistoricalMarket,
+  loadPersistentLogs,
+  getPersistentLogs,
+  getHistoricalMarkets,
+} from "./utils/logger";
 import {
   getCurrentFiveMinWindow,
   secondsRemainingInWindow,
@@ -33,6 +43,7 @@ import type { DashboardServer, DashboardState } from "./dashboard-server";
  * The profit comes from the guaranteed $1.00 payout minus total cost.
  */
 const MAX_EXECUTIONS_FOR_DASHBOARD = 50;
+const MAX_EXCHANGE_PRICE_AGE_MS = 10000;
 
 export class PolymarketArbBot {
   private readonly config: BotConfig;
@@ -48,10 +59,26 @@ export class PolymarketArbBot {
   private activeMarkets: PolymarketMarket[] = [];
   private executions: ArbitrageExecution[] = [];
   private releasedPositionKeys = new Set<string>();
-  /** Latest prices per market slug for unrealized PnL (updated each cycle) */
-  private lastMarketPricesBySlug = new Map<string, { yesBestAsk: number; noBestAsk: number }>();
+  /** BTC price at first cycle after window end, per execution key (so settlement uses correct resolution price) */
+  private settlementEndPriceByKey = new Map<string, number>();
+  /** Latest prices per market slug for unrealized PnL and stop-loss (updated each cycle) */
+  private lastMarketPricesBySlug = new Map<
+    string,
+    {
+      yesBestAsk: number;
+      noBestAsk: number;
+      yesBestBid: number;
+      noBestBid: number;
+      yesMid: number;
+      noMid: number;
+      yesBestAskSize?: number;
+      noBestAskSize?: number;
+    }
+  >();
   /** Track BTC price at the actual start of each market window (keyed by market.startTime) */
   private windowStartPrices = new Map<number, number>();
+  private recentResolvedMarkets: NonNullable<DashboardState["historicalMarkets"]> =
+    [];
   private stats = {
     cyclesRun: 0,
     opportunitiesFound: 0,
@@ -77,7 +104,8 @@ export class PolymarketArbBot {
     this.polymarketFeed = new PolymarketFeed(
       config.polymarketGammaUrl,
       config.polymarketApiUrl,
-      config.btc5mEventSlug
+      config.btc5mEventSlug,
+      config.forceRealData ?? false
     );
     this.detector = new ArbitrageDetector(
       config.minProfitThresholdCents,
@@ -114,6 +142,9 @@ export class PolymarketArbBot {
     logger.info(`Max position size: $${this.config.maxPositionSizeUsdc}`);
     logger.info(`Max open positions: ${this.config.maxOpenPositions ?? 999}`);
     logger.info(`Poll interval: ${this.config.pollIntervalMs}ms`);
+    logger.info(
+      `Data mode config: FORCE_REAL_DATA=${this.config.forceRealData ? "true" : "false"} | SIMULATE_MARKETS=${process.env.SIMULATE_MARKETS ?? "unset"}`
+    );
 
     this.isRunning = true;
     this.stats.startTime = Date.now();
@@ -124,6 +155,11 @@ export class PolymarketArbBot {
     // Initialize components
     await this.exchangeFeed.start();
     await this.trader.initialize();
+
+    // Load persistent data
+    loadTradeRecords();
+    loadHistoricalMarkets();
+    loadPersistentLogs();
 
     // Wait a moment for exchange price to arrive
     await this.sleep(2000);
@@ -236,6 +272,18 @@ export class PolymarketArbBot {
         this.windowStartPrices.delete(startTime);
       }
     }
+
+    // Refresh historical panel source from recently resolved Polymarket markets.
+    try {
+      const recentResolved = await this.polymarketFeed.getRecentResolvedBtcMarkets(10);
+      if (recentResolved.length > 0) {
+        this.recentResolvedMarkets = recentResolved;
+      }
+    } catch (error) {
+      logger.debug("Failed to refresh recently resolved markets", {
+        error: String(error),
+      });
+    }
   }
 
   /**
@@ -247,6 +295,18 @@ export class PolymarketArbBot {
     const exchangePrice = this.exchangeFeed.getLatestPrice();
     if (!exchangePrice) {
       logger.debug("No exchange price available yet");
+      return;
+    }
+    const priceAgeMs = Date.now() - exchangePrice.timestamp;
+    if (priceAgeMs > MAX_EXCHANGE_PRICE_AGE_MS) {
+      logger.warn(
+        `Exchange price is stale (${priceAgeMs}ms old), skipping cycle`
+      );
+      return;
+    }
+    if (!this.config.dryRun && this.polymarketFeed.isSimulating()) {
+      logger.warn("LIVE MODE: simulation data active, refusing to place trades");
+      this.broadcastDashboardState(exchangePrice);
       return;
     }
 
@@ -285,7 +345,26 @@ export class PolymarketArbBot {
       this.lastMarketPricesBySlug.set(market.slug, {
         yesBestAsk: prices.yesBestAsk,
         noBestAsk: prices.noBestAsk,
+        yesBestBid: prices.yesBestBid,
+        noBestBid: prices.noBestBid,
+        yesMid: prices.yesMid,
+        noMid: prices.noMid,
+        yesBestAskSize: prices.yesBestAskSize,
+        noBestAskSize: prices.noBestAskSize,
       });
+      if (market.startTime <= nowSec && nowSec < market.endTime) {
+        const [yesMidpoint, noMidpoint] = await Promise.all([
+          this.polymarketFeed.getMidpointPrice(market.yesTokenId),
+          this.polymarketFeed.getMidpointPrice(market.noTokenId),
+        ]);
+        const cached = this.lastMarketPricesBySlug.get(market.slug);
+        if (cached) {
+          if (yesMidpoint != null) cached.yesMid = yesMidpoint;
+          if (noMidpoint != null) cached.noMid = noMidpoint;
+        }
+      }
+
+      await this.tryStopLossExits(market.slug, exchangePrice.price);
 
       if (this.config.directionalOnly) {
         // --- Directional only: exchange price diverges from Polymarket ---
@@ -344,6 +423,71 @@ export class PolymarketArbBot {
   }
 
   /**
+   * For a given market, check open directional positions and exit at 5% stop-loss if unrealized
+   * loss (selling at current bid) would be >= 5% of cost. Marks trade as Stopped and records the loss.
+   */
+  private async tryStopLossExits(
+    marketSlug: string,
+    btcPriceAtExit: number
+  ): Promise<void> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const prices = this.lastMarketPricesBySlug.get(marketSlug);
+    if (!prices) return;
+
+    const stopLossPercent = 0.05;
+    for (const execution of this.executions) {
+      if (!execution.fullyExecuted) continue;
+      const { market, detectedAt, exchangeSignal } = execution.opportunity;
+      if (market.slug !== marketSlug || market.endTime <= nowSec) continue;
+      const key = `${market.slug}-${detectedAt}`;
+      if (this.releasedPositionKeys.has(key)) continue;
+      if (execution.opportunity.totalCost < 1.0) continue; // only directional
+
+      const weBetUp = exchangeSignal === "UP";
+      const filledSize = weBetUp
+        ? (execution.yesTrade.filledSize ?? 0)
+        : (execution.noTrade.filledSize ?? 0);
+      if (filledSize <= 0) continue;
+
+      const entryPrice = weBetUp
+        ? execution.opportunity.yesPrice
+        : execution.opportunity.noPrice;
+      const sellPrice = weBetUp ? prices.yesBestBid : prices.noBestBid;
+      const unrealizedProfit = sellPrice * filledSize - execution.actualTotalCost;
+      const maxLoss = stopLossPercent * execution.actualTotalCost;
+      if (unrealizedProfit > -maxLoss) continue; // not at stop-loss
+
+      const tokenId = weBetUp ? execution.opportunity.market.yesTokenId : execution.opportunity.market.noTokenId;
+      const side = weBetUp ? "YES" : "NO";
+      logger.info(
+        `Stop-loss exit: ${market.slug} | ${side} ${filledSize} @ bid $${sellPrice.toFixed(3)} | unrealized PnL=$${unrealizedProfit.toFixed(4)}`
+      );
+      const sellResult = await this.trader.placeLimitSell(tokenId, sellPrice, filledSize, side);
+      const filled = sellResult.filledSize ?? filledSize;
+      const actualProfit = sellResult.success
+        ? sellPrice * filled - execution.actualTotalCost
+        : -maxLoss; // sell failed: record capped loss and show as Stopped
+      execution.actualProfit = actualProfit;
+      execution.lossCapped = true; // show as Stopped in UI (exited at stop-loss)
+      this.lifetimeTotalProfit += execution.actualProfit;
+      this.riskManager.recordSettlement(execution.actualProfit);
+      this.releasedPositionKeys.add(key);
+      const tradeId = weBetUp
+        ? execution.yesTrade.orderId
+        : execution.noTrade.orderId;
+      if (tradeId) {
+        updateTradeSettlement(tradeId, execution.actualProfit, btcPriceAtExit);
+      }
+      if (sellResult.success) {
+        logger.info(`Stopped at 5%: PnL=$${execution.actualProfit.toFixed(4)}`);
+      } else {
+        logger.warn(`Stop-loss sell failed; recording capped loss $${execution.actualProfit.toFixed(4)}`);
+      }
+      break; // one exit per market per cycle
+    }
+  }
+
+  /**
    * Release open positions when their 5-min market window has ended.
    * For directional trades, resolve PnL using BTC at window end vs window start.
    */
@@ -356,32 +500,62 @@ export class PolymarketArbBot {
       const key = `${market.slug}-${detectedAt}`;
       if (this.releasedPositionKeys.has(key)) continue;
 
+      // Lock in the BTC price the first time we see the window has ended (with a price).
+      // Using a later cycle's price would wrongly flip UP/DOWN if BTC moved after the window closed.
+      if (btcPriceAtEnd != null && !this.settlementEndPriceByKey.has(key)) {
+        this.settlementEndPriceByKey.set(key, btcPriceAtEnd);
+      }
+      const priceAtEnd = this.settlementEndPriceByKey.get(key) ?? btcPriceAtEnd ?? null;
+
       const isDirectional = execution.opportunity.totalCost >= 1.0;
       let didResolve = false;
-      if (isDirectional && btcPriceAtEnd != null && typeof windowStartBtcPrice === "number") {
+      if (isDirectional && priceAtEnd != null && typeof windowStartBtcPrice === "number") {
         const weBetUp = exchangeSignal === "UP";
-        const yesWon = btcPriceAtEnd > windowStartBtcPrice;
-        const ourSideWon = (weBetUp && yesWon) || (!weBetUp && btcPriceAtEnd < windowStartBtcPrice);
+        const yesWon = priceAtEnd > windowStartBtcPrice;
+        const ourSideWon = (weBetUp && yesWon) || (!weBetUp && priceAtEnd < windowStartBtcPrice);
         const filledSize = weBetUp
           ? (execution.yesTrade.filledSize ?? 0)
           : (execution.noTrade.filledSize ?? 0);
         let actualProfit = ourSideWon ? filledSize * 1.0 - execution.actualTotalCost : -execution.actualTotalCost;
-        const stopLossPercent = 0.02;
+        // Stop loss: if we had exited at 5% loss we would record this; trade shows as "Stopped" in UI.
+        // In production you must exit the position (sell) before resolution when unrealized loss hits 5%,
+        // otherwise holding to resolution loses the full amount.
+        const stopLossPercent = 0.05;
         const maxLoss = stopLossPercent * execution.actualTotalCost;
         if (actualProfit < 0 && actualProfit < -maxLoss) {
           actualProfit = -maxLoss;
-          logger.info(`Stop loss applied: loss capped at ${stopLossPercent * 100}% of position`);
+          execution.lossCapped = true;
+          logger.info(`Stop loss applied: loss capped at ${stopLossPercent * 100}% (show as Stopped; exit at 5% before resolution to realize this)`);
         }
         execution.actualProfit = actualProfit;
         this.lifetimeTotalProfit += actualProfit;
         if (actualProfit > 0) this.lifetimeProfitableTrades++;
         this.riskManager.recordSettlement(actualProfit);
         didResolve = true;
+
+        // Update trade record with settlement info
+        const tradeId = weBetUp
+          ? execution.yesTrade.orderId
+          : execution.noTrade.orderId;
+        if (tradeId) {
+          updateTradeSettlement(tradeId, actualProfit, priceAtEnd);
+        }
+
+        // Record historical market
+        recordHistoricalMarket({
+          windowStart: market.startTime,
+          windowEnd: market.endTime,
+          btcPriceAtStart: windowStartBtcPrice,
+          btcPriceAtEnd: priceAtEnd,
+          outcome: yesWon ? "UP" : "DOWN",
+          recordedAt: Date.now(),
+        });
+
         logger.info(
-          `Settlement: ${market.slug} | Bet ${exchangeSignal} | BTC start=$${windowStartBtcPrice.toFixed(2)} end=$${btcPriceAtEnd.toFixed(2)} | ` +
+          `Settlement: ${market.slug} | Bet ${exchangeSignal} | BTC start=$${windowStartBtcPrice.toFixed(2)} end=$${priceAtEnd.toFixed(2)} | ` +
             `${ourSideWon ? "WON" : "LOST"} | PnL=$${actualProfit.toFixed(4)}`
         );
-      } else if (isDirectional && btcPriceAtEnd == null) {
+      } else if (isDirectional && priceAtEnd == null) {
         logger.debug(`Settlement deferred for ${market.slug}: no BTC price yet`);
         continue;
       } else if (isDirectional && typeof windowStartBtcPrice !== "number") {
@@ -393,6 +567,7 @@ export class PolymarketArbBot {
       if (!isDirectional || didResolve) {
         this.riskManager.releasePosition();
         this.releasedPositionKeys.add(key);
+        this.settlementEndPriceByKey.delete(key);
       }
     }
   }
@@ -406,15 +581,113 @@ export class PolymarketArbBot {
     this.exchangeFeed.getPricesByExchange().forEach((price, name) => {
       cexPrices[name] = price;
     });
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Prefer the market actively covering "now", then by matching endTime, then any market with cached prices.
+    const currentWindowMarket =
+      this.activeMarkets.find((m) => m.startTime <= nowSec && nowSec < m.endTime) ??
+      this.activeMarkets.find((m) => m.endTime === endTime) ??
+      this.activeMarkets.find((m) => this.lastMarketPricesBySlug.has(m.slug));
+    const marketPrices = currentWindowMarket
+      ? this.lastMarketPricesBySlug.get(currentWindowMarket.slug)
+      : undefined;
+    const currentMarketPrices =
+      marketPrices != null
+        ? { up: marketPrices.yesMid, down: marketPrices.noMid }
+        : undefined;
+    const marketVolume =
+      currentWindowMarket?.volumeUsd ??
+      currentWindowMarket?.liquidityUsd ??
+      (marketPrices != null &&
+      marketPrices.yesBestAskSize != null &&
+      marketPrices.noBestAskSize != null
+        ? marketPrices.yesBestAsk * marketPrices.yesBestAskSize +
+          marketPrices.noBestAsk * marketPrices.noBestAskSize
+        : undefined);
+
+    const liveExecutions: DashboardState["executions"] = recentExecutions.map((e) => {
+      const opp = e.opportunity;
+      const side: "UP" | "DOWN" =
+        opp.exchangeSignal === "DOWN" ? "DOWN" : "UP";
+      const entryPrice = side === "UP" ? opp.yesPrice : opp.noPrice;
+      const entryStr = `${Math.round(entryPrice * 100)}¢`;
+      const isDirectional = opp.totalCost >= 1.0;
+      const releasedKey = `${opp.market.slug}-${opp.detectedAt}`;
+      const settled = isDirectional
+        ? this.releasedPositionKeys.has(releasedKey) || e.actualProfit !== 0
+        : e.fullyExecuted;
+      const filledSize = side === "UP" ? (e.yesTrade.filledSize ?? 0) : (e.noTrade.filledSize ?? 0);
+      const prices = this.lastMarketPricesBySlug.get(opp.market.slug);
+      let unrealizedProfit: number | null = null;
+      if (!settled && prices && filledSize > 0) {
+        const currentPrice = side === "UP" ? prices.yesBestBid : prices.noBestBid;
+        unrealizedProfit = (currentPrice - entryPrice) * filledSize;
+      }
+      return {
+        marketSlug: opp.market.slug,
+        actualProfit: e.actualProfit,
+        fullyExecuted: e.fullyExecuted,
+        settled,
+        timestamp: opp.detectedAt,
+        side,
+        entry: entryStr,
+        size: opp.suggestedSize,
+        marketWindowStart: opp.market.startTime,
+        marketWindowEnd: opp.market.endTime,
+        unrealizedProfit,
+        lossCapped: e.lossCapped,
+      };
+    });
+    const persistedExecutions: DashboardState["executions"] = getTradeRecords()
+      .slice(-MAX_EXECUTIONS_FOR_DASHBOARD)
+      .map((t) => ({
+        marketSlug: t.marketSlug,
+        actualProfit: t.profit ?? 0,
+        fullyExecuted: true,
+        settled: t.settled,
+        timestamp: t.settledAt ?? t.timestamp,
+        side: t.side,
+        entry: `${Math.round(t.entryPrice * 100)}¢`,
+        size: t.size,
+        marketWindowStart: t.marketWindowStart,
+        marketWindowEnd: t.marketWindowEnd,
+        unrealizedProfit: null,
+        lossCapped: false,
+      }));
+    const seen = new Set<string>();
+    const mergedExecutions: DashboardState["executions"] = [
+      ...liveExecutions,
+      ...persistedExecutions,
+    ]
+      .filter((e) => {
+        const key = `${e.marketSlug}-${e.marketWindowEnd}-${e.timestamp}-${e.side}-${e.entry}-${e.size}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(-MAX_EXECUTIONS_FOR_DASHBOARD);
+    const recentLogs = getPersistentLogs(1000).map((l) => ({
+      level: l.level,
+      message: l.message,
+      timestamp: l.timestamp,
+      meta: l.meta ? JSON.stringify(l.meta) : undefined,
+    }));
+
     this.dashboard.broadcastState({
       btcPrice: exchangePrice?.price ?? null,
       btcTimestamp: exchangePrice?.timestamp ?? 0,
       cexPrices,
+      currentMarketPrices,
+      marketVolume,
+      dataMode: this.polymarketFeed.getDataMode(),
+      modeReason: this.polymarketFeed.getModeReason(),
+      forceRealData: this.config.forceRealData ?? false,
       activeMarketsCount: this.activeMarkets.length,
       activeMarketSlugs: this.activeMarkets.map((m) => m.slug),
       windowStartTime: startTime,
       windowEndTime: endTime,
       windowRemainingSec: secondsRemainingInWindow(),
+      windowStartBtcPrice: this.windowStartPrices.get(startTime) ?? undefined,
       risk: {
         dailyPnL: risk.dailyPnL,
         openPositions: risk.openPositions,
@@ -426,6 +699,7 @@ export class PolymarketArbBot {
         tradesExecuted: this.lifetimeTradesExecuted,
         totalProfit: this.lifetimeTotalProfit,
         startTime: this.stats.startTime,
+        profitableTrades: this.lifetimeProfitableTrades,
       },
       demoBalance: this.config.dryRun
         ? {
@@ -434,34 +708,12 @@ export class PolymarketArbBot {
           }
         : undefined,
       mode: this.config.dryRun ? "dry_run" : "live",
-      executions: recentExecutions.map((e) => {
-        const opp = e.opportunity;
-        const side = opp.exchangeSignal === "DOWN" ? "DOWN" : "UP";
-        const entryPrice = side === "UP" ? opp.yesPrice : opp.noPrice;
-        const entryStr = `${Math.round(entryPrice * 100)}¢`;
-        const isDirectional = opp.totalCost >= 1.0;
-        const settled = isDirectional ? e.actualProfit !== 0 : e.fullyExecuted;
-        const filledSize = side === "UP" ? (e.yesTrade.filledSize ?? 0) : (e.noTrade.filledSize ?? 0);
-        const prices = this.lastMarketPricesBySlug.get(opp.market.slug);
-        let unrealizedProfit: number | null = null;
-        if (!settled && prices && filledSize > 0) {
-          const currentPrice = side === "UP" ? prices.yesBestAsk : prices.noBestAsk;
-          unrealizedProfit = (currentPrice - entryPrice) * filledSize;
-        }
-        return {
-          marketSlug: opp.market.slug,
-          actualProfit: e.actualProfit,
-          fullyExecuted: e.fullyExecuted,
-          settled,
-          timestamp: opp.detectedAt,
-          side,
-          entry: entryStr,
-          size: opp.suggestedSize,
-          marketWindowStart: opp.market.startTime,
-          marketWindowEnd: opp.market.endTime,
-          unrealizedProfit,
-        };
-      }),
+      executions: mergedExecutions,
+      recentLogs,
+      historicalMarkets:
+        this.recentResolvedMarkets.length > 0
+          ? this.recentResolvedMarkets
+          : getHistoricalMarkets(100),
     });
   }
 

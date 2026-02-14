@@ -52,6 +52,7 @@ export class RiskManager {
     reason?: string;
   } {
     this.maybeResetDaily();
+    const now = Date.now();
 
     // Check open positions
     if (this.openPositions >= this.maxOpenPositions) {
@@ -70,8 +71,19 @@ export class RiskManager {
       };
     }
 
+    // Check minimum spacing between trades
+    if (
+      this.lastTradeTime > 0 &&
+      now - this.lastTradeTime < this.minTimeBetweenTradesMs
+    ) {
+      const waitMs = this.minTimeBetweenTradesMs - (now - this.lastTradeTime);
+      return {
+        allowed: false,
+        reason: `Min time between trades not met: wait ${waitMs}ms`,
+      };
+    }
+
     // Check trades per minute
-    const now = Date.now();
     const oneMinuteAgo = now - 60000;
     this.recentTrades = this.recentTrades.filter((t) => t > oneMinuteAgo);
     if (this.recentTrades.length >= this.maxTradesPerMinute) {

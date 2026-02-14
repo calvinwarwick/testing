@@ -5,8 +5,9 @@ import {
   ArbitrageOpportunity,
   TradeResult,
   BotConfig,
+  TradeRecord,
 } from "../types";
-import { logger } from "../utils/logger";
+import { logger, recordTrade } from "../utils/logger";
 
 /**
  * Handles trade execution on Polymarket's CLOB.
@@ -158,8 +159,8 @@ export class Trader {
         tokenID: tokenId,
         price: price.toFixed(4),
         size: size.toString(),
-        side: "BUY",
-        type: "GTC", // Good-til-cancelled
+        side: "BUY" as const,
+        type: "GTC",
         feeRateBps: "0",
       };
 
@@ -194,6 +195,57 @@ export class Trader {
   }
 
   /**
+   * Place a limit sell order (e.g. to exit a position at a stop-loss).
+   */
+  async placeLimitSell(
+    tokenId: string,
+    price: number,
+    size: number,
+    side: "YES" | "NO"
+  ): Promise<TradeResult> {
+    const tradeResult: TradeResult = {
+      success: false,
+      side: side === "YES" ? "NO" : "YES",
+      price,
+      size,
+      timestamp: Date.now(),
+    };
+
+    if (this.config.dryRun) {
+      logger.info(
+        `[DRY RUN] SELL ${side}: ${size} shares @ $${price.toFixed(3)} (token: ${tokenId.slice(0, 12)}...)`
+      );
+      return { ...tradeResult, success: true, orderId: `dry-run-sell-${Date.now()}`, filledSize: size };
+    }
+
+    try {
+      const orderPayload = {
+        tokenID: tokenId,
+        price: price.toFixed(4),
+        size: size.toString(),
+        side: "SELL" as const,
+        type: "GTC",
+        feeRateBps: "0",
+      };
+      const signedOrder = await this.signOrder(orderPayload);
+      const response = await this.httpClient.post(
+        "/order",
+        { order: signedOrder },
+        { headers: this.getAuthHeaders("POST", "/order", JSON.stringify(signedOrder)) }
+      );
+      tradeResult.success = true;
+      tradeResult.orderId = response.data.orderID;
+      tradeResult.filledSize = parseFloat(response.data.filledSize || "0");
+      logger.info(`ORDER PLACED: SELL ${side} ${size} @ $${price.toFixed(3)} | ID: ${tradeResult.orderId}`);
+      return tradeResult;
+    } catch (error) {
+      tradeResult.error = String(error);
+      logger.error(`Failed to place SELL ${side} order`, { error: String(error), price, size });
+      return tradeResult;
+    }
+  }
+
+  /**
    * Sign an order using EIP-712 typed structured data.
    * This is how the CLOB validates order authenticity.
    */
@@ -218,11 +270,12 @@ export class Trader {
       ],
     };
 
+    const sideNum = orderPayload.side === "SELL" ? 1 : 0;
     const value = {
       tokenId: orderPayload.tokenID,
       price: Math.round(parseFloat(orderPayload.price) * 10000),
       size: Math.round(parseFloat(orderPayload.size)),
-      side: 0, // BUY
+      side: sideNum,
     };
 
     const signature = await this.wallet.signTypedData(domain, types, value);
@@ -280,6 +333,23 @@ export class Trader {
         `DIRECTIONAL EXECUTED: ${targetSide} ${filledSize} @ $${price.toFixed(3)} | ` +
           `Cost=$${actualTotalCost.toFixed(4)} | PnL at settlement`
       );
+
+      // Record the trade
+      const tradeRecord: TradeRecord = {
+        id: trade.orderId ?? `trade-${Date.now()}`,
+        timestamp: Date.now(),
+        marketSlug: opportunity.market.slug,
+        side: opportunity.exchangeSignal as "UP" | "DOWN",
+        type: "directional",
+        entryPrice: price,
+        size: filledSize,
+        cost: actualTotalCost,
+        settled: false,
+        marketWindowStart: opportunity.market.startTime,
+        marketWindowEnd: opportunity.market.endTime,
+        btcPriceAtEntry: opportunity.exchangePrice.price,
+      };
+      recordTrade(tradeRecord);
     } else {
       logger.warn(`DIRECTIONAL FAILED: ${targetSide} order did not fill`);
     }
@@ -340,6 +410,26 @@ export class Trader {
           `Profit=$${actualProfit.toFixed(4)} | ` +
           `Filled: YES=${yesFilledSize} NO=${noFilledSize}`
       );
+
+      // Record the trade
+      const tradeRecord: TradeRecord = {
+        id: yesTrade.orderId ?? `arb-${Date.now()}`,
+        timestamp: Date.now(),
+        marketSlug: opportunity.market.slug,
+        side: "UP", // Arbitrage covers both sides
+        type: "arbitrage",
+        entryPrice: opportunity.totalCost,
+        size: minFilled,
+        cost: actualTotalCost,
+        settled: true, // Arbitrage is instantly profitable
+        settledAt: Date.now(),
+        profit: actualProfit,
+        outcome: actualProfit > 0 ? "win" : "loss",
+        marketWindowStart: opportunity.market.startTime,
+        marketWindowEnd: opportunity.market.endTime,
+        btcPriceAtEntry: opportunity.exchangePrice.price,
+      };
+      recordTrade(tradeRecord);
     } else {
       logger.warn(
         `ARB PARTIAL: YES=${yesTrade.success ? "OK" : "FAIL"} ` +

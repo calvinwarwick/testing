@@ -40,7 +40,7 @@ export function loadConfig(): BotConfig {
     dryRun,
     btc5mEventSlug: optionalEnv("POLYMARKET_BTC_5M_EVENT_SLUG", "") || undefined,
     dashboardWsPort: Number(optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
-    maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "999")) || 999),
+    maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "20")) || 20),
     sessionFile: optionalEnv("SESSION_FILE", "data/session.json") || undefined,
     maxProfitPercentBeforeSuspicious: Math.max(
       10,
@@ -57,6 +57,7 @@ export function loadConfig(): BotConfig {
     minExchangeMovePercent: Math.max(0.03, Math.min(1, Number(optionalEnv("MIN_EXCHANGE_MOVE_PERCENT", "0.05")) || 0.05)),
     minSecondsRemainingInWindow: Math.max(60, Math.min(240, Number(optionalEnv("MIN_SECONDS_REMAINING_IN_WINDOW", "120")) || 120)),
     demoStartingBalance: Math.max(100, Number(optionalEnv("DEMO_STARTING_BALANCE", "1000")) || 1000),
+    forceRealData: optionalEnv("FORCE_REAL_DATA", "false") === "true",
   };
   return config;
 }

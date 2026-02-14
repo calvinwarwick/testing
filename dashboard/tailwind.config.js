@@ -13,13 +13,15 @@ export default {
         negative: "#ef4444",
         open: "#eab308",
         muted: "#a1a1aa",
+        /* Very dark grey for section titles, borders and dividers (visible on #111 panel) */
+        edge: "#2d2d2d",
       },
       fontFamily: {
         mono: ["JetBrains Mono", "ui-monospace", "monospace"],
       },
       borderColor: {
-        /* Very subtle: barely visible dark grey, no white/contrasting borders */
         subtle: "#0d0d0d",
+        edge: "#2d2d2d",
       },
     },
   },

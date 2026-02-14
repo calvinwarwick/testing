@@ -5,6 +5,7 @@ import { logger } from "../utils/logger";
 
 const AGGREGATE_INTERVAL_MS = 2000;
 const REST_TIMEOUT_MS = 5000;
+const MAX_PRICE_AGE_MS = 15000;
 
 type PriceEntry = { price: number; timestamp: number };
 
@@ -21,6 +22,7 @@ export class ExchangeFeed {
   private maxReconnectAttempts = 10;
   private isRunning = false;
   private restInterval: ReturnType<typeof setInterval> | null = null;
+  private restFetchInProgress = false;
 
   private readonly binanceWsUrl =
     "wss://stream.binance.com:9443/ws/btcusdt@ticker";
@@ -122,6 +124,10 @@ export class ExchangeFeed {
   }
 
   getLatestPrice(): ExchangePrice | null {
+    if (!this.aggregated) return null;
+    if (Date.now() - this.aggregated.timestamp > MAX_PRICE_AGE_MS) {
+      return null;
+    }
     return this.aggregated;
   }
 
@@ -139,6 +145,7 @@ export class ExchangeFeed {
   }
 
   private recomputeAggregated(): void {
+    this.evictStalePrices();
     if (this.prices.size === 0) return;
     const values = Array.from(this.prices.values()).map((e) => e.price);
     values.sort((a, b) => a - b);
@@ -158,21 +165,36 @@ export class ExchangeFeed {
     };
   }
 
+  private evictStalePrices(): void {
+    const cutoff = Date.now() - MAX_PRICE_AGE_MS;
+    for (const [exchange, entry] of this.prices) {
+      if (entry.timestamp < cutoff) {
+        this.prices.delete(exchange);
+      }
+    }
+  }
+
   private async fetchAllRest(): Promise<void> {
-    const results = await Promise.allSettled(
-      ExchangeFeed.REST_SOURCES.map(async (src) => {
-        const res = await axios.get(src.url, { timeout: REST_TIMEOUT_MS });
-        const price = src.parse(res.data);
-        if (price != null && Number.isFinite(price)) {
-          this.setPrice(src.name, price);
-        }
-      })
-    );
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed > 0) {
-      logger.debug(
-        `REST feeds: ${this.prices.size}/${ExchangeFeed.REST_SOURCES.length} succeeded`
+    if (this.restFetchInProgress) return;
+    this.restFetchInProgress = true;
+    try {
+      const results = await Promise.allSettled(
+        ExchangeFeed.REST_SOURCES.map(async (src) => {
+          const res = await axios.get(src.url, { timeout: REST_TIMEOUT_MS });
+          const price = src.parse(res.data);
+          if (price != null && Number.isFinite(price)) {
+            this.setPrice(src.name, price);
+          }
+        })
       );
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        logger.debug(
+          `REST feeds: ${this.prices.size}/${ExchangeFeed.REST_SOURCES.length} succeeded`
+        );
+      }
+    } finally {
+      this.restFetchInProgress = false;
     }
   }
 

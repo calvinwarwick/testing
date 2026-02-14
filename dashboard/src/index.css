@@ -27,3 +27,43 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   @apply bg-neutral-500;
 }
+
+/* Pulsating green dot for live positions */
+@keyframes live-dot-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.15);
+    box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.2);
+  }
+}
+.animate-live-dot {
+  animation: live-dot-pulse 1.5s ease-in-out infinite;
+}
+
+/* Log categories – distinct colours per category */
+.log-cat-error {
+  color: #ef4444;
+}
+.log-cat-warn {
+  color: #f59e0b;
+}
+.log-cat-settlement {
+  color: #06b6d4;
+}
+.log-cat-trade {
+  color: #22c55e;
+}
+.log-cat-risk {
+  color: #f97316;
+}
+.log-cat-info {
+  color: #fafafa;
+}
+.log-cat-debug {
+  color: #71717a;
+}

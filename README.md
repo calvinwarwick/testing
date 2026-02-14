@@ -105,6 +105,7 @@ cp .env.example .env
 | `MAX_POSITION_SIZE_USDC` | Max USDC per trade | No (default: 100) |
 | `POLL_INTERVAL_MS` | Price polling interval | No (default: 1000) |
 | `DRY_RUN` | Paper trading mode | No (default: true) |
+| `FORCE_REAL_DATA` | Require live Polymarket data and refuse simulation fallback | No (default: false) |
 
 ## Usage
 
@@ -114,6 +115,15 @@ cp .env.example .env
 # Monitors prices and logs opportunities without placing real orders
 DRY_RUN=true npm run dev
 ```
+
+### Live Data + Demo Trading (recommended test mode)
+
+```bash
+# Uses live exchange + Polymarket data but keeps execution in paper mode
+DRY_RUN=true FORCE_REAL_DATA=true npm run dev
+```
+
+Make sure `SIMULATE_MARKETS` is unset/false in this mode.
 
 ### Live Trading
 
