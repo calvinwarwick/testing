@@ -1,3 +1,4 @@
+import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
 /** Historical market record */
@@ -86,6 +87,7 @@ export interface DashboardLogEntry {
 }
 
 export class DashboardServer {
+  private httpServer: http.Server | null = null;
   private wss: WebSocketServer | null = null;
   private clients: Set<WebSocket> = new Set();
   private lastState: DashboardState | null = null;
@@ -95,34 +97,50 @@ export class DashboardServer {
   start(): void {
     if (this.port <= 0) return;
     try {
-      this.wss = new WebSocketServer({ port: this.port });
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+      });
+      this.wss = new WebSocketServer({ noServer: true });
+      this.wss.on("connection", (ws) => {
+        this.clients.add(ws);
+        if (this.lastState) {
+          try {
+            ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
+          } catch (_) {}
+        }
+        ws.on("close", () => this.clients.delete(ws));
+        ws.on("error", () => this.clients.delete(ws));
+      });
+      server.on("upgrade", (req, socket, head) => {
+        this.wss!.handleUpgrade(req, socket, head, (ws) => {
+          this.wss!.emit("connection", ws, req);
+        });
+      });
+      server.listen(this.port, () => {
+        console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
+      });
+      this.httpServer = server;
+      this.httpServer.on("error", (err) => {
+        console.warn(`Dashboard server error: ${err}`);
+        this.stop();
+      });
     } catch (err) {
-      console.warn(`Dashboard WebSocket failed to start on port ${this.port}: ${err}`);
+      console.warn(`Dashboard server failed to start on port ${this.port}: ${err}`);
       return;
     }
-    this.wss.on("error", (err) => {
-      console.warn(`Dashboard WebSocket error: ${err}`);
-      this.stop();
-    });
-    this.wss.on("connection", (ws) => {
-      this.clients.add(ws);
-      if (this.lastState) {
-        try {
-          ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
-        } catch (_) {}
-      }
-      ws.on("close", () => this.clients.delete(ws));
-      ws.on("error", () => this.clients.delete(ws));
-    });
-    console.log(`Dashboard WebSocket server listening on ws://localhost:${this.port}`);
   }
 
   stop(): void {
+    this.clients.forEach((c) => c.close());
+    this.clients.clear();
     if (this.wss) {
-      this.clients.forEach((c) => c.close());
-      this.clients.clear();
       this.wss.close();
       this.wss = null;
+    }
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
     }
   }
 

@@ -39,7 +39,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: Number(optionalEnv("POLL_INTERVAL_MS", "1000")),
     dryRun,
     btc5mEventSlug: optionalEnv("POLYMARKET_BTC_5M_EVENT_SLUG", "") || undefined,
-    dashboardWsPort: Number(optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
+    dashboardWsPort: Number(process.env.PORT ?? optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
     maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "20")) || 20),
     sessionFile: optionalEnv("SESSION_FILE", "data/session.json") || undefined,
     maxProfitPercentBeforeSuspicious: Math.max(
