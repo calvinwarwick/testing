@@ -245,6 +245,64 @@ export class PolymarketFeed {
   }
 
   /**
+   * Fetch last N resolved BTC 5-min markets using the event-by-slug endpoint so we get
+   * exactly one event per window (avoids list endpoint returning the same event for multiple slugs).
+   */
+  async getLastResolvedBtcMarketsBySlug(limit: number = 5): Promise<
+    Array<{
+      windowStart: number;
+      windowEnd: number;
+      outcome: "UP" | "DOWN";
+      recordedAt: number;
+      btcPriceAtStart: number;
+      btcPriceAtEnd: number;
+    }>
+  > {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const latestResolvedStart =
+      Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC - FIVE_MIN_SEC;
+    const slugs: string[] = [];
+    for (let i = 0; i < limit; i++) {
+      slugs.push(`btc-updown-5m-${latestResolvedStart - i * FIVE_MIN_SEC}`);
+    }
+    const out: Array<{
+      windowStart: number;
+      windowEnd: number;
+      outcome: "UP" | "DOWN";
+      recordedAt: number;
+      btcPriceAtStart: number;
+      btcPriceAtEnd: number;
+    }> = [];
+    for (const slug of slugs) {
+      try {
+        const res = await axios.get<GammaEvent>(`${this.gammaUrl}/events/slug/${encodeURIComponent(slug)}`, {
+          timeout: 6000,
+        });
+        const event = res.data as GammaEvent | null;
+        if (!event) continue;
+        const market =
+          event.markets?.find((m) => m.slug === slug) ?? event.markets?.[0];
+        if (!market || market.closed !== true) continue;
+        const windowStart = this.parseSlugTimestamp(market.slug || event.slug || slug);
+        if (!windowStart || windowStart % FIVE_MIN_SEC !== 0) continue;
+        const outcome = this.resolveUpDownOutcome(market);
+        if (!outcome) continue;
+        out.push({
+          windowStart,
+          windowEnd: windowStart + FIVE_MIN_SEC,
+          outcome,
+          recordedAt: Date.now(),
+          btcPriceAtStart: 0,
+          btcPriceAtEnd: 0,
+        });
+      } catch {
+        // skip this slug
+      }
+    }
+    return out.sort((a, b) => b.windowEnd - a.windowEnd).slice(0, limit);
+  }
+
+  /**
    * Fetch BTC 5-min markets by requesting event slugs for the current and next windows.
    * Slug pattern: btc-updown-5m-{unix_timestamp} (window end time, 5-min = 300s apart).
    * We use current time so we always request windows that exist (not a fixed env slug).
@@ -462,6 +520,92 @@ export class PolymarketFeed {
       });
       return [];
     }
+  }
+
+  /**
+   * Fetch raw Polymarket API responses for the given market (Gamma events + CLOB order books).
+   * Returns the exact API response bodies for dashboard/testing.
+   */
+  async getRawPolymarketApiSnapshot(market: PolymarketMarket): Promise<{
+    gamma?: unknown;
+    clobYes?: unknown;
+    clobNo?: unknown;
+  }> {
+    const out: { gamma?: unknown; clobYes?: unknown; clobNo?: unknown } = {};
+    const [gammaRes, clobYesRes, clobNoRes] = await Promise.allSettled([
+      axios.get(`${this.gammaUrl}/events`, {
+        params: { slug: market.slug, closed: "false", limit: "5" },
+        timeout: 8000,
+      }),
+      axios.get(`${this.clobUrl}/book`, {
+        params: { token_id: market.yesTokenId },
+        timeout: 5000,
+      }),
+      axios.get(`${this.clobUrl}/book`, {
+        params: { token_id: market.noTokenId },
+        timeout: 5000,
+      }),
+    ]);
+    if (gammaRes.status === "fulfilled") out.gamma = gammaRes.value.data;
+    if (clobYesRes.status === "fulfilled") out.clobYes = clobYesRes.value.data;
+    if (clobNoRes.status === "fulfilled") out.clobNo = clobNoRes.value.data;
+    return out;
+  }
+
+  /**
+   * Fetch raw Gamma API response for a slug (when we have no active market).
+   * Returns the exact API response body for dashboard/testing.
+   */
+  async getRawGammaBySlug(slug: string): Promise<{ gamma?: unknown }> {
+    try {
+      const res = await axios.get(`${this.gammaUrl}/events`, {
+        params: { slug, closed: "false", limit: "5" },
+        timeout: 8000,
+      });
+      return { gamma: res.data };
+    } catch {
+      return {};
+    }
+  }
+
+  /** Fixed event slug for dashboard "Polymarket API" testing panel. */
+  static readonly TEST_EVENT_SLUG = "btc-updown-5m-1771175100";
+
+  /**
+   * Fetch raw Polymarket API responses for the fixed test event (Gamma + CLOB when token IDs available).
+   * Uses Gamma's event-by-slug endpoint so we get exactly the requested market, not a different one.
+   */
+  async getRawPolymarketApiSnapshotForTestEvent(): Promise<{
+    gamma?: unknown;
+    clobYes?: unknown;
+    clobNo?: unknown;
+  }> {
+    const slug = PolymarketFeed.TEST_EVENT_SLUG;
+    const out: { gamma?: unknown; clobYes?: unknown; clobNo?: unknown } = {};
+    try {
+      const gammaRes = await axios.get(`${this.gammaUrl}/events/slug/${encodeURIComponent(slug)}`, {
+        timeout: 8000,
+      });
+      const event = gammaRes.data as { slug?: string; markets?: Array<{ slug?: string; clobTokenIds?: string | string[] }> } | null;
+      if (!event || (event.slug && event.slug !== slug)) {
+        out.gamma = null;
+        return out;
+      }
+      out.gamma = event;
+      const market = event?.markets?.find((m) => m?.slug === slug) ?? event?.markets?.[0];
+      const tokenIds = market ? this.parseClobTokenIds(market.clobTokenIds) : [];
+      if (tokenIds.length >= 2) {
+        const [clobYesRes, clobNoRes] = await Promise.allSettled([
+          axios.get(`${this.clobUrl}/book`, { params: { token_id: tokenIds[0] }, timeout: 5000 }),
+          axios.get(`${this.clobUrl}/book`, { params: { token_id: tokenIds[1] }, timeout: 5000 }),
+        ]);
+        if (clobYesRes.status === "fulfilled") out.clobYes = clobYesRes.value.data;
+        if (clobNoRes.status === "fulfilled") out.clobNo = clobNoRes.value.data;
+      }
+    } catch {
+      // keep partial out
+    }
+    return out;
   }
 
   /**
@@ -735,6 +879,21 @@ export class PolymarketFeed {
       if (/\bno\b/.test(label)) return "DOWN";
       return null;
     };
+
+    // Check outcomePrices first - if one is 1 and the other is 0, that tells us the winner
+    const outcomePrices = this.parseStringArray(market.outcomePrices);
+    if (outcomePrices.length >= 2 && normalized.length >= 2) {
+      const price0 = parseFloat(outcomePrices[0]);
+      const price1 = parseFloat(outcomePrices[1]);
+      if (Number.isFinite(price0) && Number.isFinite(price1)) {
+        // Price of 1 means that outcome won, price of 0 means it lost
+        if (price0 > 0.9 && price1 < 0.1) {
+          return mapLabel(normalized[0]);
+        } else if (price1 > 0.9 && price0 < 0.1) {
+          return mapLabel(normalized[1]);
+        }
+      }
+    }
 
     // Prefer the explicit winner marker when available.
     if (winnerRaw) {

@@ -28,7 +28,7 @@ export class RiskManager {
   }) {
     this.maxPositionUsdc = options.maxPositionUsdc;
     this.maxOpenPositions = Math.max(1, options.maxOpenPositions ?? 3);
-    this.maxTradesPerMinute = options.maxTradesPerMinute || 10;
+    this.maxTradesPerMinute = options.maxTradesPerMinute ?? 20;
     this.minTimeBetweenTradesMs = options.minTimeBetweenTradesMs ?? 2000;
     this.maxProfitPercentBeforeSuspicious =
       options.maxProfitPercentBeforeSuspicious ?? 50;

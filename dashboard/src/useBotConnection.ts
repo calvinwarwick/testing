@@ -84,9 +84,14 @@ export interface BotState {
     marketWindowEnd: number;
     unrealizedProfit: number | null;
     lossCapped?: boolean;
+    id?: string;
   }>;
+  /** Full history of all trades from persisted log (newest first), for Closed tab */
+  tradeHistory?: BotState["executions"];
   /** Historical markets from persistent storage */
   historicalMarkets?: HistoricalMarket[];
+  /** Raw Polymarket API responses for current market (Gamma + CLOB), for testing */
+  polymarketApiOutput?: unknown;
 }
 
 export interface LogEntry {
@@ -123,7 +128,12 @@ export function useBotConnection() {
         const msg = JSON.parse(event.data as string);
         if (msg.type === "state") {
           const s = msg.payload as BotState;
-          setState(s);
+          const payload = s.polymarketApiOutput as { lastFiveMarkets?: unknown[] } | undefined;
+          const hasLastFive = Array.isArray(payload?.lastFiveMarkets) && payload.lastFiveMarkets.length > 0;
+          setState((prev) => ({
+            ...s,
+            polymarketApiOutput: hasLastFive ? s.polymarketApiOutput : (prev?.polymarketApiOutput ?? s.polymarketApiOutput),
+          }));
           if (Array.isArray(s.recentLogs) && s.recentLogs.length > 0) {
             setLogs((prev) =>
               prev.length > 0
@@ -148,10 +158,12 @@ export function useBotConnection() {
           }
         } else if (msg.type === "log") {
           setLogs((prev) => {
-            const next = sortLogsChronological([
-              ...prev,
-              msg.payload as LogEntry,
-            ]);
+            const entry = msg.payload as LogEntry;
+            const isDuplicate = prev.some(
+              (e) => e.timestamp === entry.timestamp && e.message === entry.message
+            );
+            if (isDuplicate) return prev;
+            const next = sortLogsChronological([...prev, entry]);
             return next.length > MAX_LOGS
               ? next.slice(next.length - MAX_LOGS)
               : next;
@@ -197,6 +209,17 @@ export function formatWindowRange(startSec: number, endSec: number): string {
       timeZone: "America/New_York",
     });
   return `${fmt(start)}-${fmt(end)} ET`;
+}
+
+/** Format a window end time (Unix seconds) as "12:45AM ET" */
+export function formatWindowEndTime(endSec: number): string {
+  const end = new Date(endSec * 1000);
+  return end.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: "America/New_York",
+  }) + " ET";
 }
 
 /** Format seconds remaining as "M:SS" */

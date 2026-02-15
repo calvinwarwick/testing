@@ -50,14 +50,18 @@ export function loadConfig(): BotConfig {
       0,
       Number(optionalEnv("MIN_TIME_BETWEEN_TRADES_MS", "2000")) || 2000
     ),
+    maxTradesPerMinute: Math.max(1, Number(optionalEnv("MAX_TRADES_PER_MINUTE", "20")) || 20),
     pureArbOnly: optionalEnv("PURE_ARB_ONLY", "false") === "true",
     directionalOnly: optionalEnv("DIRECTIONAL_ONLY", "true") === "true",
-    minEdgePercent: Math.max(1, Math.min(50, Number(optionalEnv("MIN_EDGE_PERCENT", "10")) || 10)),
+    minEdgePercent: Math.max(1, Math.min(50, Number(optionalEnv("MIN_EDGE_PERCENT", "8")) || 8)),
     exchangeSignalThresholdPercent: Math.max(0.01, Math.min(1, Number(optionalEnv("EXCHANGE_SIGNAL_THRESHOLD_PERCENT", "0.03")) || 0.03)),
     minExchangeMovePercent: Math.max(0.03, Math.min(1, Number(optionalEnv("MIN_EXCHANGE_MOVE_PERCENT", "0.05")) || 0.05)),
-    minSecondsRemainingInWindow: Math.max(60, Math.min(240, Number(optionalEnv("MIN_SECONDS_REMAINING_IN_WINDOW", "120")) || 120)),
+    minSecondsRemainingInWindow: Math.max(10, Math.min(240, Number(optionalEnv("MIN_SECONDS_REMAINING_IN_WINDOW", "10")) || 10)),
     demoStartingBalance: Math.max(100, Number(optionalEnv("DEMO_STARTING_BALANCE", "1000")) || 1000),
     forceRealData: optionalEnv("FORCE_REAL_DATA", "false") === "true",
+    chainlinkDsApiKey: optionalEnv("CHAINLINK_DS_API_KEY", "") || undefined,
+    chainlinkDsApiSecret: optionalEnv("CHAINLINK_DS_API_SECRET", "") || undefined,
+    chainlinkBtcUsdFeedId: optionalEnv("CHAINLINK_BTC_USD_FEED_ID", "") || undefined,
   };
   return config;
 }

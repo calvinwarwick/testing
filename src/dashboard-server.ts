@@ -67,9 +67,15 @@ export interface DashboardState {
     unrealizedProfit: number | null;
     /** True when a loss was capped by stop-loss (so P/L is not the full loss) */
     lossCapped?: boolean;
+    /** Optional stable id (e.g. from persisted trade record) for list keys */
+    id?: string;
   }>;
+  /** Full history of all trades from persisted log (newest first), for Closed tab */
+  tradeHistory?: DashboardState["executions"];
   /** Historical markets (last 100) */
   historicalMarkets?: HistoricalMarketRecord[];
+  /** Raw Polymarket API responses for current market (Gamma + CLOB), for testing */
+  polymarketApiOutput?: unknown;
 }
 
 export interface DashboardLogEntry {

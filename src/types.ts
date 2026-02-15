@@ -33,6 +33,8 @@ export interface BotConfig {
   maxProfitPercentBeforeSuspicious?: number;
   /** Min ms between trades (default 2000) */
   minTimeBetweenTradesMs?: number;
+  /** Max trades per minute (default 20). Rate limit to prevent runaway trading. */
+  maxTradesPerMinute?: number;
   /** If true, only take pure arbitrage (yes+no < $1); skip directional opportunities */
   pureArbOnly?: boolean;
   /** If true, only take directional trades (exchange vs Polymarket); skip pure arbitrage */
@@ -43,12 +45,18 @@ export interface BotConfig {
   exchangeSignalThresholdPercent?: number;
   /** For directional, require at least this % exchange move (default 0.15). Avoids trading on noise. */
   minExchangeMovePercent?: number;
-  /** Don't open new directional trades when less than this many seconds left in window (default 120 = 2 min). */
+  /** Don't open new directional trades when less than this many seconds left in window (default 10). */
   minSecondsRemainingInWindow?: number;
   /** Demo starting balance in USD when dry run (default 1000). Used for display and 5% max per trade. */
   demoStartingBalance?: number;
   /** If true, refuse simulation fallback and require live Polymarket market data. */
   forceRealData?: boolean;
+  /** Optional: Chainlink Data Streams API key (UUID). When set with chainlinkDsApiSecret, window start price is fetched from Chainlink to align with Polymarket. */
+  chainlinkDsApiKey?: string;
+  /** Optional: Chainlink Data Streams API secret for HMAC auth. */
+  chainlinkDsApiSecret?: string;
+  /** Optional: Chainlink Data Streams BTC/USD feed ID (hex). If unset and Chainlink is configured, resolved via listFeeds() or default constant. */
+  chainlinkBtcUsdFeedId?: string;
 }
 
 /** Persisted session state for cross-restart tracking. */
@@ -208,5 +216,9 @@ export interface TradeRecord {
   marketWindowStart: number;
   marketWindowEnd: number;
   btcPriceAtEntry: number;
+  /** BTC price at official window start (for correct resolution); set for directional trades */
+  btcPriceAtWindowStart?: number;
   btcPriceAtSettlement?: number;
+  /** True if position was closed by stop-loss (not held to resolution) */
+  lossCapped?: boolean;
 }

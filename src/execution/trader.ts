@@ -350,6 +350,7 @@ export class Trader {
         marketWindowStart: opportunity.market.startTime,
         marketWindowEnd: opportunity.market.endTime,
         btcPriceAtEntry: opportunity.exchangePrice.price,
+        btcPriceAtWindowStart: opportunity.windowStartBtcPrice,
       };
       recordTrade(tradeRecord);
     } else {

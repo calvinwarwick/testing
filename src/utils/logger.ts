@@ -122,7 +122,8 @@ export function recordTrade(trade: TradeRecord): void {
 export function updateTradeSettlement(
   id: string,
   profit: number,
-  btcPriceAtSettlement: number
+  btcPriceAtSettlement: number,
+  lossCapped?: boolean
 ): boolean {
   const trade = tradeRecords.find((t) => t.id === id);
   if (!trade) return false;
@@ -132,8 +133,10 @@ export function updateTradeSettlement(
   trade.profit = profit;
   trade.outcome = profit > 0 ? "win" : "loss";
   trade.btcPriceAtSettlement = btcPriceAtSettlement;
+  if (lossCapped != null) trade.lossCapped = lossCapped;
   saveTradeRecords();
-  logger.info(`Trade settled: ${id} ${trade.outcome} $${profit.toFixed(2)}`);
+  const statusLabel = lossCapped ? "stopped" : trade.outcome;
+  logger.info(`Trade settled: ${id} ${statusLabel} $${profit.toFixed(2)}`);
   return true;
 }
 
@@ -214,7 +217,8 @@ export function recordHistoricalMarket(market: HistoricalMarket): void {
   if (historicalMarkets.some((m) => m.windowEnd === market.windowEnd)) {
     return;
   }
-  historicalMarkets.push(market);
+  // Insert at the top so the most recently closed window is first in the list
+  historicalMarkets.unshift(market);
   saveHistoricalMarkets();
   logger.info(`Historical market recorded: ${new Date(market.windowEnd * 1000).toISOString()} outcome=${market.outcome}`);
 }

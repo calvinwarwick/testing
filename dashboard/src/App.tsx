@@ -6,7 +6,7 @@ import {
   YAxis,
   ResponsiveContainer,
 } from "recharts";
-import { useBotConnection, formatWindowRange, formatRemaining } from "./useBotConnection";
+import { useBotConnection, formatWindowRange, formatWindowEndTime, formatRemaining } from "./useBotConnection";
 import {
   cumulativePnl,
   btcSeries,
@@ -388,7 +388,7 @@ export default function App() {
           </div>
           <div className="flex flex-col gap-0.5 items-center">
             <span className="text-muted text-[10px] uppercase tracking-wider text-center">Open</span>
-            <span className="text-open font-mono font-medium text-sm">
+            <span className="text-primary font-mono font-medium text-sm">
               {formatUsd(openTradesValue)}
             </span>
           </div>
@@ -511,7 +511,7 @@ export default function App() {
         {/* Last 10 resolved 5min BTC markets (UP/DOWN) - from Polymarket */}
         <section className="col-span-4 bg-bg-panel border-b border-edge p-2 flex flex-col min-h-0">
           <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
-            HISTORICAL MARKETS ({Math.min(8, state?.historicalMarkets?.length ?? 0)} shown)
+            HISTORICAL MARKETS
           </h2>
           <div className="flex-1 overflow-y-auto min-h-0">
             {(() => {
@@ -537,10 +537,7 @@ export default function App() {
                         className="font-mono tabular-nums text-sm font-medium"
                         style={{ color: "#a1a1aa" }}
                       >
-                        {formatWindowRange(
-                          Math.min(m.windowStart, m.windowEnd),
-                          Math.max(m.windowStart, m.windowEnd)
-                        )}
+                        {formatWindowEndTime(m.windowEnd)}
                       </span>
                       <span
                         className={`font-mono text-sm font-medium shrink-0 pr-2 ${
@@ -703,8 +700,8 @@ export default function App() {
           </div>
         </section>
 
-        {/* Logs - full width */}
-        <section className="col-span-12 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0">
+        {/* Logs (left half) */}
+        <section className="col-span-6 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0">
           <div className="flex items-center justify-between p-2 pb-1">
             <h2 className="text-edge text-xs uppercase tracking-wider">
               LIVE LOGS ({logs.length}/1000) {!connected && "(disconnected)"}
@@ -774,6 +771,56 @@ export default function App() {
           </div>
         </section>
 
+        {/* Last 5 markets: Chainlink BTC start/end (compare with Polymarket) */}
+        <section className="col-span-6 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0 border-l border-edge">
+          <div className="p-2 pb-1">
+            <h2 className="text-edge text-xs uppercase tracking-wider">
+              Last 5 markets (Chainlink BTC start / end)
+            </h2>
+          </div>
+          <div
+            className="flex-1 overflow-auto p-2 pt-1 font-mono text-[11px] min-h-0 bg-bg-dark/40 text-muted"
+            style={{ fontFamily: "JetBrains Mono, monospace" }}
+          >
+            {(() => {
+              const payload = state?.polymarketApiOutput as { lastFiveMarkets?: Array<{ slug: string; btcStartPrice?: number; btcEndPrice?: number }> } | null | undefined;
+              const list = payload?.lastFiveMarkets;
+              if (list && list.length > 0) {
+                const usd = (n: number | undefined) => (n != null ? `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—");
+                return (
+                  <table className="w-full text-[11px] border-collapse">
+                    <thead>
+                      <tr className="text-edge border-b border-edge">
+                        <th className="text-left py-1 pr-2 font-medium">Market ID</th>
+                        <th className="text-right py-1 px-1 font-medium">BTC start</th>
+                        <th className="text-right py-1 pl-1 font-medium">BTC end</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {list.map((row) => (
+                        <tr key={row.slug} className="border-b border-edge/50 text-primary">
+                          <td className="py-0.5 pr-2 truncate max-w-[180px]" title={row.slug}>
+                            {row.slug}
+                          </td>
+                          <td className="text-right py-0.5 px-1 tabular-nums">{usd(row.btcStartPrice)}</td>
+                          <td className="text-right py-0.5 pl-1 tabular-nums">{usd(row.btcEndPrice)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                );
+              }
+              return (
+                <span className="text-muted">
+                  {connected
+                    ? "Waiting for last 5 markets…"
+                    : "Disconnected — no data."}
+                </span>
+              );
+            })()}
+          </div>
+        </section>
+
         </div>
 
         {/* Right: Positions - full height */}
@@ -816,9 +863,19 @@ export default function App() {
               const openList = executions.filter(
                 (e) => e.fullyExecuted && !e.settled && !isExpired(e)
               );
-              const closedList = executions.filter((e) => e.settled || isExpired(e));
+              // Closed tab: use full trade history when available, else current run's closed executions
+              const closedFromHistory =
+                positionsTab === "closed" && state?.tradeHistory?.length
+                  ? state.tradeHistory.filter((e) => e.settled)
+                  : null;
+              const closedList =
+                closedFromHistory ??
+                executions.filter((e) => e.settled || isExpired(e));
               const list = positionsTab === "open" ? openList : closedList;
-              const displayList = [...list].reverse();
+              const displayList =
+                positionsTab === "closed" && closedFromHistory
+                  ? closedFromHistory
+                  : [...list].reverse();
               const totalPages = Math.max(
                 1,
                 Math.ceil(displayList.length / positionsRowsPerPage)
@@ -858,7 +915,7 @@ export default function App() {
                           : e.marketSlug.replace(/^btc-updown-5m-/, "");
                       return (
                         <div
-                          key={`${e.marketSlug}-${e.marketWindowEnd ?? e.timestamp}-${i}`}
+                          key={(e as { id?: string }).id ?? `${e.marketSlug}-${e.timestamp}-${e.side}-${i}`}
                           className="flex items-center justify-between py-2.5 px-3 border-b border-edge last:border-0"
                           style={{
                             borderLeft: `3px solid ${e.side === "UP" ? "#22c55e" : "#ef4444"}`,
