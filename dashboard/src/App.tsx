@@ -533,7 +533,10 @@ export default function App() {
                       key={m.windowEnd}
                       className="flex items-center justify-between py-2.5 pl-2 border-b border-edge last:border-0"
                     >
-                      <span className="font-mono text-sm text-primary">
+                      <span
+                        className="font-mono tabular-nums text-sm font-medium"
+                        style={{ color: "#a1a1aa" }}
+                      >
                         {formatWindowRange(
                           Math.min(m.windowStart, m.windowEnd),
                           Math.max(m.windowStart, m.windowEnd)
@@ -902,9 +905,6 @@ export default function App() {
                               {displayProfit >= 0 ? "+" : ""}
                               {formatUsdSmall(displayProfit)}
                             </span>
-                            {e.lossCapped && (
-                              <span className="text-muted text-xs">stopped at 5%</span>
-                            )}
                           </div>
                         </div>
                       );

@@ -169,7 +169,7 @@ export class PolymarketFeed {
 
   /**
    * Fetch most recent resolved BTC 5-min markets directly from Polymarket.
-   * Uses prior window slugs and resolves outcome from outcomePrices.
+   * Uses prior window slugs and resolves outcome from winner/outcomes labels.
    */
   async getRecentResolvedBtcMarkets(limit: number = 10): Promise<
     Array<{
@@ -724,25 +724,42 @@ export class PolymarketFeed {
 
   private resolveUpDownOutcome(market: GammaMarket): "UP" | "DOWN" | null {
     const outcomes = this.parseStringArray(market.outcomes);
-    const prices = this.parseStringArray(market.outcomePrices).map((p) =>
-      parseFloat(p)
-    );
-    if (outcomes.length === 0 || prices.length === 0) return null;
+    const normalized = outcomes.map((o) => o.toLowerCase());
+    const winnerRaw =
+      typeof market.winner === "string" ? market.winner.toLowerCase().trim() : "";
 
-    // Only accept final, decisive markets (e.g. 1/0). Ignore ambiguous non-resolved prices.
-    const sorted = [...prices].sort((a, b) => b - a);
-    const bestPrice = sorted[0] ?? 0;
-    const secondPrice = sorted[1] ?? 0;
-    const decisive = bestPrice >= 0.99 && secondPrice <= 0.01;
-    if (!decisive) return null;
+    const mapLabel = (label: string): "UP" | "DOWN" | null => {
+      if (/\bup\b/.test(label)) return "UP";
+      if (/\bdown\b/.test(label)) return "DOWN";
+      if (/\byes\b/.test(label)) return "UP";
+      if (/\bno\b/.test(label)) return "DOWN";
+      return null;
+    };
 
-    const paired = outcomes.map((label, i) => ({
-      label: label.toLowerCase(),
-      price: prices[i] ?? 0,
-    }));
-    const best = paired.reduce((a, b) => (b.price > a.price ? b : a), paired[0]);
-    if (/\bup\b/.test(best.label)) return "UP";
-    if (/\bdown\b/.test(best.label)) return "DOWN";
+    // Prefer the explicit winner marker when available.
+    if (winnerRaw) {
+      const winnerFromLabel = mapLabel(winnerRaw);
+      if (winnerFromLabel) return winnerFromLabel;
+      if (/^\d+$/.test(winnerRaw) && normalized.length > 0) {
+        const idx = Number(winnerRaw);
+        if (idx >= 0 && idx < normalized.length) {
+          const winnerFromIndex = mapLabel(normalized[idx]);
+          if (winnerFromIndex) return winnerFromIndex;
+        }
+      }
+    }
+
+    // Fallback: direct outcomes label mapping for markets that expose only one definitive label.
+    if (normalized.length === 1) {
+      return mapLabel(normalized[0]);
+    }
+
+    // Secondary fallback: if outcomes include explicit UP/DOWN labels, use their first appearance.
+    for (const label of normalized) {
+      const mapped = mapLabel(label);
+      if (mapped) return mapped;
+    }
+
     return null;
   }
 

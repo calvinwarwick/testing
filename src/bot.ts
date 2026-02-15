@@ -851,7 +851,7 @@ export class PolymarketArbBot {
     const minSecLeft = this.config.minSecondsRemainingInWindow ?? 120;
     const marketSecondsRemaining = opportunity.market.endTime - nowSec;
     if (marketSecondsRemaining < minSecLeft) {
-      logger.debug(
+      logger.info(
         `Skip directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s)`
       );
       return;
@@ -873,7 +873,7 @@ export class PolymarketArbBot {
         suggestedSize: opportunity.suggestedSize,
       });
       if (!decision.allowed) {
-        logger.debug(
+        logger.info(
           `Skip trade: demo capital check failed (${decision.reason}) ` +
             `balance=$${decision.currentBalanceUsd.toFixed(2)} ` +
             `reserved=$${decision.reservedCapitalUsd.toFixed(2)} ` +
@@ -921,7 +921,7 @@ export class PolymarketArbBot {
     const preExecuteNowSec = Math.floor(Date.now() / 1000);
     const remainingBeforeExecution = toExecute.market.endTime - preExecuteNowSec;
     if (remainingBeforeExecution <= EXECUTION_END_BUFFER_SEC) {
-      logger.debug(
+      logger.info(
         `Skip trade: ${toExecute.market.slug} too close to end (${remainingBeforeExecution}s <= ${EXECUTION_END_BUFFER_SEC}s execution buffer)`
       );
       return;
