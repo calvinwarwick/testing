@@ -329,20 +329,21 @@ export default function App() {
     state?.windowStartBtcPrice != null &&
     state?.btcPrice != null &&
     state?.currentMarketPrices != null;
-  const cexProbability = hasEdgeInputs
+  const windowStartBtcPrice = state?.windowStartBtcPrice ?? null;
+  const cexProbability = hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null
     ? Math.min(
         0.8,
         0.5 +
           (Math.abs(
-            ((state.btcPrice - state.windowStartBtcPrice) / state.windowStartBtcPrice) *
+            ((btcPrice - windowStartBtcPrice!) / windowStartBtcPrice!) *
               100
           ) *
             0.4)
       ) * 100
     : null;
   const exchangeSignal =
-    hasEdgeInputs && state.btcPrice !== state.windowStartBtcPrice
-      ? state.btcPrice > state.windowStartBtcPrice
+    hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null && btcPrice !== windowStartBtcPrice
+      ? btcPrice > windowStartBtcPrice!
         ? "UP"
         : "DOWN"
       : null;
@@ -357,9 +358,9 @@ export default function App() {
       ? cexProbability - polymarketProbability
       : null;
   const sigma =
-    hasEdgeInputs && state.windowStartBtcPrice > 0
+    hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null && windowStartBtcPrice > 0
       ? Math.abs(
-          ((state.btcPrice - state.windowStartBtcPrice) / state.windowStartBtcPrice) *
+          ((btcPrice - windowStartBtcPrice!) / windowStartBtcPrice!) *
             100
         ) / 0.15
       : null;
