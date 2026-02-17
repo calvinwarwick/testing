@@ -66,7 +66,15 @@ async function main(): Promise<void> {
     process.on("SIGINT", () => shutdownWithCleanup("SIGINT"));
     process.on("SIGTERM", () => shutdownWithCleanup("SIGTERM"));
 
-    await bot.start();
+    try {
+      await bot.start();
+    } catch (error) {
+      logger.error("Bot failed to start", { error: String(error) });
+      // If dashboard is serving, keep process alive so dashboard stays up (e.g. on Railway)
+      if (!dashboard) {
+        process.exit(1);
+      }
+    }
   } catch (error) {
     logger.error("Fatal error", { error: String(error) });
     process.exit(1);
