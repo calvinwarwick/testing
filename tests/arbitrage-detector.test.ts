@@ -51,99 +51,7 @@ describe("ArbitrageDetector", () => {
   let detector: ArbitrageDetector;
 
   beforeEach(() => {
-    // Min profit = 2 cents, max position = $100
-    detector = new ArbitrageDetector(2, 100);
-  });
-
-  describe("detectArbitrage", () => {
-    it("should detect arbitrage when YES + NO < $1.00", () => {
-      // YES at $0.48 + NO at $0.48 = $0.96 total -> 4 cent profit
-      const prices = makeMockPrices(0.48, 0.48);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).not.toBeNull();
-      expect(opp!.totalCost).toBeCloseTo(0.96);
-      expect(opp!.profitPerShare).toBeCloseTo(0.04);
-      expect(opp!.profitPercent).toBeCloseTo(4.167, 1);
-    });
-
-    it("should return null when YES + NO >= $1.00 (no arb)", () => {
-      // YES at $0.55 + NO at $0.46 = $1.01 total -> no profit
-      const prices = makeMockPrices(0.55, 0.46);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).toBeNull();
-    });
-
-    it("should return null when profit is below threshold", () => {
-      // YES at $0.495 + NO at $0.495 = $0.99 -> 1 cent profit (below 2c threshold)
-      const prices = makeMockPrices(0.495, 0.495);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).toBeNull();
-    });
-
-    it("should detect arb when both sides are cheap (market maker gap)", () => {
-      // YES at $0.40 + NO at $0.40 = $0.80 -> 20 cent profit per share
-      const prices = makeMockPrices(0.4, 0.4);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).not.toBeNull();
-      expect(opp!.profitPerShare).toBeCloseTo(0.2);
-    });
-
-    it("should calculate suggested size based on max position", () => {
-      // Cost per pair = $0.96, max position = $100 -> 104 pairs
-      const prices = makeMockPrices(0.48, 0.48);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).not.toBeNull();
-      expect(opp!.suggestedSize).toBe(104); // floor(100 / 0.96)
-    });
-
-    it("should include exchange price and signal in opportunity", () => {
-      const prices = makeMockPrices(0.48, 0.48);
-      const exchangePrice = makeMockExchangePrice(65000);
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).not.toBeNull();
-      expect(opp!.exchangePrice.price).toBe(65000);
-      expect(opp!.exchangeSignal).toBeDefined();
-    });
-
-    it("should handle edge case of exactly $1.00 total", () => {
-      const prices = makeMockPrices(0.5, 0.5);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      // Exactly $1.00 = 0 profit, should be rejected
-      expect(opp).toBeNull();
-    });
-
-    it("should yield positive expected profit for pure arb (execution would be profitable)", () => {
-      const prices = makeMockPrices(0.48, 0.48);
-      const exchangePrice = makeMockExchangePrice();
-
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-
-      expect(opp).not.toBeNull();
-      expect(opp!.totalCost).toBeLessThan(1);
-      expect(opp!.totalExpectedProfit).toBeGreaterThan(0);
-      const expectedFromFormula = (1 - opp!.totalCost) * opp!.suggestedSize;
-      expect(opp!.totalExpectedProfit).toBeCloseTo(expectedFromFormula, 5);
-    });
+    detector = new ArbitrageDetector(100);
   });
 
   describe("getExchangeSignal", () => {
@@ -204,28 +112,14 @@ describe("ArbitrageDetector", () => {
     });
   });
 
-  describe("PnL accounting: guaranteed vs directional", () => {
-    /** Condition used in bot: only count execution profit in lifetime when totalCost < 1 (pure arb). */
-    function isGuaranteedProfit(opportunity: ArbitrageOpportunity): boolean {
-      return opportunity.totalCost < 1.0;
-    }
-
-    it("pure arb opportunity (totalCost < 1) is guaranteed profit", () => {
-      const prices = makeMockPrices(0.48, 0.48);
-      const exchangePrice = makeMockExchangePrice();
-      const opp = detector.detectArbitrage(prices, exchangePrice);
-      expect(opp).not.toBeNull();
-      expect(isGuaranteedProfit(opp!)).toBe(true);
-    });
-
-    it("directional opportunity (totalCost >= 1) is not guaranteed profit at execution", () => {
+  describe("directional opportunity totalCost", () => {
+    it("directional opportunity has totalCost >= 1", () => {
       detector.setWindowReference(65000, Math.floor(Date.now() / 1000));
       const prices = makeMockPrices(0.55, 0.5); // YES + NO = 1.05
       const exchangePrice = makeMockExchangePrice(65325);
       const opp = detector.detectDirectionalOpportunity(prices, exchangePrice);
       expect(opp).not.toBeNull();
       expect(opp!.totalCost).toBeGreaterThanOrEqual(1.0);
-      expect(isGuaranteedProfit(opp!)).toBe(false);
     });
   });
 });

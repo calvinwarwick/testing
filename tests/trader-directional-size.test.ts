@@ -20,7 +20,6 @@ function makeConfig(): BotConfig {
     polygonRpcUrl: "https://polygon-rpc.com",
     binanceApiKey: "",
     binanceApiSecret: "",
-    minProfitThresholdCents: 2,
     maxPositionSizeUsdc: 1000,
     pollIntervalMs: 1000,
     dryRun: true,

@@ -16,7 +16,6 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     polygonRpcUrl: "https://polygon-rpc.com",
     binanceApiKey: "",
     binanceApiSecret: "",
-    minProfitThresholdCents: 2,
     maxPositionSizeUsdc: 1000,
     pollIntervalMs: 250,
     dryRun: true,

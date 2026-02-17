@@ -7,34 +7,18 @@ import {
 import { logger } from "../utils/logger";
 
 /**
- * Arbitrage detection engine.
- *
- * STRATEGY: On Polymarket, binary markets have YES and NO tokens.
- * Together they always resolve to exactly $1.00 (one wins, one loses).
- *
- *   If we buy 1 YES at $0.48 + 1 NO at $0.48 = $0.96 total cost
- *   After resolution, one pays $1.00 -> guaranteed $0.04 profit
- *
- * This happens when:
- *   1. The market is inefficient (yes_ask + no_ask < 1.00)
- *   2. There's a price delay: exchange prices move but Polymarket
- *      hasn't caught up, temporarily mispricing both sides
- *
- * The delay comes from Polymarket using Chainlink/UMA oracles to
- * resolve markets. Exchange prices update in milliseconds; oracle
- * prices update in seconds-to-minutes. During this window, market
- * makers on Polymarket may not have adjusted their quotes.
+ * Directional detection engine for 5-min BTC up/down markets.
+ * Compares exchange (CEX) price vs window-start price for signal (UP/DOWN)
+ * and Polymarket YES/NO asks for edge vs fair value.
  */
 export class ArbitrageDetector {
-  private readonly minProfitCents: number;
   private readonly maxPositionUsdc: number;
 
   /** Track the reference price at the start of each 5-min window */
   private windowReferencePrice: number | null = null;
   private windowStartTime: number = 0;
 
-  constructor(minProfitCents: number, maxPositionUsdc: number) {
-    this.minProfitCents = minProfitCents;
+  constructor(maxPositionUsdc: number) {
     this.maxPositionUsdc = maxPositionUsdc;
   }
 
@@ -46,7 +30,7 @@ export class ArbitrageDetector {
   setWindowReference(price: number, windowStart: number): void {
     this.windowReferencePrice = price;
     this.windowStartTime = windowStart;
-    logger.info(
+    logger.debug(
       `Window reference set: $${price.toFixed(2)} at ${new Date(windowStart * 1000).toISOString()}`
     );
   }
@@ -76,73 +60,8 @@ export class ArbitrageDetector {
   }
 
   /**
-   * Core detection: check if buying both YES + NO costs less than $1.
-   *
-   * Returns an ArbitrageOpportunity if profitable, null otherwise.
-   */
-  detectArbitrage(
-    marketPrices: MarketPrices,
-    exchangePrice: ExchangePrice
-  ): ArbitrageOpportunity | null {
-    const yesAsk = marketPrices.yesBestAsk;
-    const noAsk = marketPrices.noBestAsk;
-    const totalCost = yesAsk + noAsk;
-
-    // The guaranteed profit per share pair
-    const profitPerShare = 1.0 - totalCost;
-    const profitCents = profitPerShare * 100;
-
-    // Log every check for monitoring
-    logger.debug(
-      `Arb check: YES=${yesAsk.toFixed(3)} + NO=${noAsk.toFixed(3)} = ${totalCost.toFixed(3)} | profit=${profitCents.toFixed(1)}c`,
-      { market: marketPrices.market.slug }
-    );
-
-    // Must meet minimum profit threshold
-    if (profitCents < this.minProfitCents) {
-      return null;
-    }
-
-    // Calculate how many share pairs we can buy within position limits
-    const maxSharesByBudget = Math.floor(this.maxPositionUsdc / totalCost);
-    const suggestedSize = Math.max(1, maxSharesByBudget);
-
-    const signal = this.getExchangeSignal(exchangePrice.price);
-
-    const opportunity: ArbitrageOpportunity = {
-      market: marketPrices.market,
-      totalCost,
-      profitPerShare,
-      profitPercent: (profitPerShare / totalCost) * 100,
-      yesPrice: yesAsk,
-      noPrice: noAsk,
-      suggestedSize,
-      totalExpectedProfit: profitPerShare * suggestedSize,
-      exchangePrice,
-      exchangeSignal: signal,
-      detectedAt: Date.now(),
-    };
-
-    logger.info(
-      `ARB DETECTED: ${marketPrices.market.slug} | ` +
-        `YES=$${yesAsk.toFixed(3)} + NO=$${noAsk.toFixed(3)} = $${totalCost.toFixed(3)} | ` +
-        `Profit: $${opportunity.totalExpectedProfit.toFixed(4)} (${opportunity.profitPercent.toFixed(2)}%) | ` +
-        `Signal: ${signal} | Size: ${suggestedSize}`
-    );
-
-    return opportunity;
-  }
-
-  /**
-   * Enhanced detection that also considers directional trades.
-   *
-   * Beyond pure arbitrage (yes+no<$1), we can also make directional
-   * bets when the exchange price strongly signals a direction but
-   * Polymarket hasn't adjusted yet.
-   *
-   * Example: BTC jumps 0.5% on Binance in 30 seconds, but Polymarket's
-   * "BTC up in next 5 min" YES token is still priced at $0.50.
-   * We'd expect it to be worth ~$0.70+ given the momentum.
+   * Detect a directional opportunity when CEX signals a direction and
+   * Polymarket hasn't fully priced it in (edge above threshold).
    */
   detectDirectionalOpportunity(
     marketPrices: MarketPrices,
@@ -184,6 +103,12 @@ export class ArbitrageDetector {
 
     if (edgePercent < minEdgePercent) return null;
 
+    // Kelly Criterion: optimal fraction of bankroll to wager
+    // For a binary outcome paying $1 if correct, $0 if wrong:
+    //   f* = (p - cost) / (1 - cost)
+    // where p = estimated win probability, cost = entry price per share
+    const kellyFraction = Math.max(0, (estimatedFairPrice - targetAsk) / (1 - targetAsk));
+
     const otherAsk =
       signal === "UP" ? marketPrices.noBestAsk : marketPrices.yesBestAsk;
     const totalCost = targetAsk + otherAsk;
@@ -191,11 +116,10 @@ export class ArbitrageDetector {
     logger.info(
       `DIRECTIONAL: ${targetToken} on ${marketPrices.market.slug} | ` +
         `Ask=$${targetAsk.toFixed(3)} vs Fair=$${estimatedFairPrice.toFixed(3)} | ` +
-        `Edge: ${edgePercent.toFixed(1)}% | Exchange move: ${pctMove.toFixed(3)}%`
+        `Edge: ${edgePercent.toFixed(1)}% | Kelly: ${(kellyFraction * 100).toFixed(1)}% | Exchange move: ${pctMove.toFixed(3)}%`
     );
 
-    // suggestedSize must respect total cost (we buy BOTH YES and NO), so
-    // totalCost * suggestedSize <= maxPositionUsdc
+    // suggestedSize is a max-position fallback; actual sizing uses Kelly in demo-capital
     const suggestedSize = Math.max(
       1,
       Math.floor(this.maxPositionUsdc / totalCost)
@@ -214,6 +138,8 @@ export class ArbitrageDetector {
       exchangeSignal: signal,
       windowStartBtcPrice: this.windowReferencePrice ?? undefined,
       detectedAt: Date.now(),
+      kellyFraction,
+      estimatedWinProbability: estimatedFairPrice,
     };
   }
 }

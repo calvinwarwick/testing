@@ -2,7 +2,7 @@ import { ArbitrageOpportunity, ArbitrageExecution } from "../types";
 import { logger } from "./logger";
 
 /**
- * Risk management for the arbitrage bot.
+ * Risk management for the directional bot.
  *
  * Enforces position limits and prevents runaway trading in case of data feed issues.
  */
@@ -11,7 +11,6 @@ export class RiskManager {
   private readonly maxOpenPositions: number;
   private readonly maxTradesPerMinute: number;
   private readonly minTimeBetweenTradesMs: number;
-  private readonly maxProfitPercentBeforeSuspicious: number;
 
   private dailyPnL: number = 0;
   private openPositions: number = 0;
@@ -24,14 +23,11 @@ export class RiskManager {
     maxOpenPositions?: number;
     maxTradesPerMinute?: number;
     minTimeBetweenTradesMs?: number;
-    maxProfitPercentBeforeSuspicious?: number;
   }) {
     this.maxPositionUsdc = options.maxPositionUsdc;
     this.maxOpenPositions = Math.max(1, options.maxOpenPositions ?? 3);
-    this.maxTradesPerMinute = options.maxTradesPerMinute ?? 20;
+    this.maxTradesPerMinute = options.maxTradesPerMinute ?? 50;
     this.minTimeBetweenTradesMs = options.minTimeBetweenTradesMs ?? 2000;
-    this.maxProfitPercentBeforeSuspicious =
-      options.maxProfitPercentBeforeSuspicious ?? 50;
     this.resetDaily();
   }
 
@@ -100,14 +96,6 @@ export class RiskManager {
       };
     }
 
-    // Sanity check: for pure arb only, profit % should be reasonable (directional can have high edge %)
-    if (opportunity.totalCost < 1.0 && opportunity.profitPercent > this.maxProfitPercentBeforeSuspicious) {
-      return {
-        allowed: false,
-        reason: `Suspicious profit ${opportunity.profitPercent.toFixed(1)}% — possible data error`,
-      };
-    }
-
     return { allowed: true };
   }
 
@@ -121,10 +109,7 @@ export class RiskManager {
 
     if (execution.fullyExecuted) {
       this.openPositions++;
-      // PnL is tracked when positions resolve, but we record expected profit
-      logger.info(
-        `Risk: Open positions: ${this.openPositions} | Expected PnL from trade: $${execution.actualProfit.toFixed(4)}`
-      );
+      logger.debug(`Risk: open positions ${this.openPositions}`);
     }
   }
 
@@ -134,9 +119,7 @@ export class RiskManager {
   recordSettlement(profit: number): void {
     this.dailyPnL += profit;
     this.openPositions = Math.max(0, this.openPositions - 1);
-    logger.info(
-      `Risk: Settlement profit=$${profit.toFixed(4)} | Daily PnL=$${this.dailyPnL.toFixed(4)} | Open: ${this.openPositions}`
-    );
+    logger.info(`Settlement: $${profit.toFixed(2)} | Daily PnL $${this.dailyPnL.toFixed(2)} | Open ${this.openPositions}`);
   }
 
   /**
@@ -146,7 +129,7 @@ export class RiskManager {
   releasePosition(): void {
     if (this.openPositions > 0) {
       this.openPositions--;
-      logger.info(`Risk: Position released (window ended). Open: ${this.openPositions}`);
+      logger.debug(`Risk: position released, open ${this.openPositions}`);
     }
   }
 
@@ -178,9 +161,7 @@ export class RiskManager {
 
   private maybeResetDaily(): void {
     if (Date.now() > this.dailyResetTime) {
-      logger.info(
-        `Daily risk reset — Previous PnL: $${this.dailyPnL.toFixed(4)}`
-      );
+      logger.debug(`Daily risk reset, previous PnL $${this.dailyPnL.toFixed(2)}`);
       this.resetDaily();
     }
   }

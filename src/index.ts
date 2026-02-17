@@ -5,14 +5,12 @@ import { DashboardServer } from "./dashboard-server";
 import { loadSession, saveSession } from "./session-store";
 
 /**
- * Entry point for the Polymarket 5-minute crypto arbitrage bot.
+ * Entry point for the Polymarket 5-minute BTC directional bot.
  *
  * Strategy summary:
- *   - Monitor BTC price on Binance (real-time via WebSocket)
- *   - Monitor YES/NO prices on Polymarket 5-min crypto markets
- *   - When YES_ask + NO_ask < $1.00, buy both sides for guaranteed profit
- *   - The price delay between exchanges and Polymarket's oracle creates
- *     windows where both sides are temporarily cheap
+ *   - Monitor BTC price on CEX (real-time) and Polymarket 5-min up/down markets
+ *   - When CEX signals a direction (vs window start) and Polymarket hasn't fully
+ *     priced it in (edge above threshold), take a directional bet (YES or NO)
  *
  * Usage:
  *   DRY_RUN=true npm run dev     # Paper trading (logs only, no real orders)

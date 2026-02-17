@@ -51,7 +51,7 @@ describe("Directional Strategy Simulation", () => {
   const MIN_MOVE = 0.15; // 0.15%
 
   beforeEach(() => {
-    detector = new ArbitrageDetector(2, 100);
+    detector = new ArbitrageDetector(100);
   });
 
   it("should estimate fair price correctly based on BTC move", () => {

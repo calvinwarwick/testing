@@ -92,9 +92,7 @@ export class ExchangeFeed {
 
   async start(): Promise<void> {
     this.isRunning = true;
-    logger.info(
-      "Starting exchange price feed (Binance, Coinbase, OKX, Bybit, Kraken, Bitfinex → aggregated)"
-    );
+    logger.info("Exchange feed starting (REST + Binance WS)");
 
     await this.fetchAllRest();
     this.recomputeAggregated();
@@ -120,7 +118,7 @@ export class ExchangeFeed {
     }
     this.prices.clear();
     this.aggregated = null;
-    logger.info("Exchange price feed stopped");
+    logger.debug("Exchange feed stopped");
   }
 
   getLatestPrice(): ExchangePrice | null {
@@ -205,7 +203,7 @@ export class ExchangeFeed {
       this.ws = new WebSocket(this.binanceWsUrl);
 
       this.ws.on("open", () => {
-        logger.info("Binance WebSocket connected");
+        logger.debug("Binance WebSocket connected");
         this.reconnectAttempts = 0;
       });
 
@@ -250,9 +248,7 @@ export class ExchangeFeed {
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
-    logger.info(
-      `Reconnecting Binance WebSocket in ${delay}ms (attempt ${this.reconnectAttempts})`
-    );
+    logger.debug(`Reconnecting Binance WS in ${delay}ms (attempt ${this.reconnectAttempts})`);
     setTimeout(() => this.connectWebSocket(), delay);
   }
 }

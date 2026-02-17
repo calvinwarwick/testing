@@ -17,7 +17,7 @@ import { logger, recordTrade } from "../utils/logger";
  * - Matching happens off-chain on the CLOB operator
  * - Settlement happens on-chain via the CTF Exchange contract
  *
- * For our arbitrage strategy, we place limit orders at the
+ * For our directional strategy, we place limit orders at the
  * current best ask for both YES and NO tokens simultaneously.
  */
 export class Trader {
@@ -50,12 +50,8 @@ export class Trader {
       const provider = new ethers.JsonRpcProvider(this.config.polygonRpcUrl);
       this.wallet = new ethers.Wallet(this.config.polygonPrivateKey, provider);
 
-      logger.info(`Trader wallet: ${this.wallet.address}`);
-
-      // Derive L2 API credentials via CLOB
       await this.deriveApiCredentials();
-
-      logger.info("Trader initialized with API credentials");
+      logger.info(`Trader initialized: ${this.wallet.address}`);
     } catch (error) {
       logger.error("Failed to initialize trader", { error: String(error) });
       throw error;
@@ -88,7 +84,7 @@ export class Trader {
       this.apiSecret = response.data.secret;
       this.apiPassphrase = response.data.passphrase;
 
-      logger.info("L2 API credentials derived successfully");
+      logger.debug("L2 API credentials derived");
     } catch (error) {
       logger.error("Failed to derive API credentials", {
         error: String(error),
@@ -236,7 +232,7 @@ export class Trader {
       tradeResult.success = true;
       tradeResult.orderId = response.data.orderID;
       tradeResult.filledSize = parseFloat(response.data.filledSize || "0");
-      logger.info(`ORDER PLACED: SELL ${side} ${size} @ $${price.toFixed(3)} | ID: ${tradeResult.orderId}`);
+      logger.debug(`ORDER PLACED: SELL ${side} ${size} @ $${price.toFixed(3)} | ID: ${tradeResult.orderId}`);
       return tradeResult;
     } catch (error) {
       tradeResult.error = String(error);
@@ -351,6 +347,8 @@ export class Trader {
         marketWindowEnd: opportunity.market.endTime,
         btcPriceAtEntry: opportunity.exchangePrice.price,
         btcPriceAtWindowStart: opportunity.windowStartBtcPrice,
+        kellyFraction: opportunity.kellyFraction,
+        estimatedWinProbability: opportunity.estimatedWinProbability,
       };
       recordTrade(tradeRecord);
     } else {
@@ -361,95 +359,11 @@ export class Trader {
   }
 
   /**
-   * Execute a full arbitrage: buy both YES and NO simultaneously.
-   *
-   * We buy both sides at their respective ask prices.
-   * Since YES + NO always resolves to $1.00, if total cost < $1.00,
-   * the difference is our guaranteed profit.
-   */
-  async executeArbitrage(
-    opportunity: ArbitrageOpportunity
-  ): Promise<ArbitrageExecution> {
-    logger.info(
-      `Executing arbitrage on ${opportunity.market.slug}: ` +
-        `${opportunity.suggestedSize} pairs @ $${opportunity.totalCost.toFixed(3)}`
-    );
-
-    const [yesTrade, noTrade] = await Promise.all([
-      this.placeLimitBuy(
-        opportunity.market.yesTokenId,
-        opportunity.yesPrice,
-        opportunity.suggestedSize,
-        "YES"
-      ),
-      this.placeLimitBuy(
-        opportunity.market.noTokenId,
-        opportunity.noPrice,
-        opportunity.suggestedSize,
-        "NO"
-      ),
-    ]);
-
-    const yesFilledSize = yesTrade.filledSize || 0;
-    const noFilledSize = noTrade.filledSize || 0;
-    const minFilled = Math.min(yesFilledSize, noFilledSize);
-
-    const actualTotalCost =
-      yesTrade.price * yesFilledSize + noTrade.price * noFilledSize;
-    const actualProfit = minFilled * 1.0 - actualTotalCost;
-
-    const execution: ArbitrageExecution = {
-      opportunity,
-      yesTrade,
-      noTrade,
-      actualTotalCost,
-      actualProfit,
-      fullyExecuted: yesTrade.success && noTrade.success,
-      settled: true,
-    };
-
-    if (execution.fullyExecuted) {
-      logger.info(
-        `ARB EXECUTED: Cost=$${actualTotalCost.toFixed(4)} | ` +
-          `Profit=$${actualProfit.toFixed(4)} | ` +
-          `Filled: YES=${yesFilledSize} NO=${noFilledSize}`
-      );
-
-      // Record the trade
-      const tradeRecord: TradeRecord = {
-        id: yesTrade.orderId ?? `arb-${Date.now()}`,
-        timestamp: Date.now(),
-        marketSlug: opportunity.market.slug,
-        side: "UP", // Arbitrage covers both sides
-        type: "arbitrage",
-        entryPrice: opportunity.totalCost,
-        size: minFilled,
-        cost: actualTotalCost,
-        settled: true, // Arbitrage is instantly profitable
-        settledAt: Date.now(),
-        profit: actualProfit,
-        outcome: actualProfit > 0 ? "win" : "loss",
-        marketWindowStart: opportunity.market.startTime,
-        marketWindowEnd: opportunity.market.endTime,
-        btcPriceAtEntry: opportunity.exchangePrice.price,
-      };
-      recordTrade(tradeRecord);
-    } else {
-      logger.warn(
-        `ARB PARTIAL: YES=${yesTrade.success ? "OK" : "FAIL"} ` +
-          `NO=${noTrade.success ? "OK" : "FAIL"}`
-      );
-    }
-
-    return execution;
-  }
-
-  /**
    * Cancel an open order by ID.
    */
   async cancelOrder(orderId: string): Promise<boolean> {
     if (this.config.dryRun) {
-      logger.info(`[DRY RUN] Cancel order: ${orderId}`);
+      logger.debug(`[DRY RUN] Cancel order: ${orderId}`);
       return true;
     }
 
@@ -457,7 +371,7 @@ export class Trader {
       await this.httpClient.delete(`/order/${orderId}`, {
         headers: this.getAuthHeaders("DELETE", `/order/${orderId}`),
       });
-      logger.info(`Order cancelled: ${orderId}`);
+      logger.debug(`Order cancelled: ${orderId}`);
       return true;
     } catch (error) {
       logger.error(`Failed to cancel order ${orderId}`, {

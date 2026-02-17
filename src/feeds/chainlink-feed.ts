@@ -46,7 +46,7 @@ async function resolveBtcUsdFeed(): Promise<void> {
     if (btcUsd) {
       if (!preferredId) resolvedFeedId = btcUsd.feedID;
       resolvedDecimals = typeof btcUsd.decimals === "number" && btcUsd.decimals >= 0 ? btcUsd.decimals : DEFAULT_PRICE_DECIMALS;
-      logger.info("Chainlink BTC/USD feed resolved", { feedID: resolvedFeedId, decimals: resolvedDecimals });
+      logger.debug("Chainlink BTC/USD feed resolved", { feedID: resolvedFeedId, decimals: resolvedDecimals });
     }
   } catch (err) {
     logger.debug("Chainlink listFeeds failed, using default decimals", { error: String(err) });
