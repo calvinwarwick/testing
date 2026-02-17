@@ -115,9 +115,9 @@ export class DashboardServer {
       filePath = "/index.html";
     }
 
-    // Remove query string
-    const cleanPath = filePath.split("?")[0];
-    const fullPath = path.join(this.dashboardDistPath, cleanPath);
+    // Remove query string and leading slash so path.join doesn't treat path as absolute (which would ignore dashboardDistPath on Unix)
+    const cleanPath = (filePath.split("?")[0] || "").replace(/^\//, "") || "index.html";
+    const fullPath = path.resolve(this.dashboardDistPath, cleanPath);
 
     // Security: prevent directory traversal
     if (!fullPath.startsWith(this.dashboardDistPath)) {
