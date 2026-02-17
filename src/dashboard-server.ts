@@ -220,7 +220,8 @@ export class DashboardServer {
           this.wss!.emit("connection", ws, req);
         });
       });
-      server.listen(this.port, () => {
+      // Bind to 0.0.0.0 so Railway (and other cloud proxies) can reach the server
+      server.listen(this.port, "0.0.0.0", () => {
         console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
       });
       this.httpServer = server;
