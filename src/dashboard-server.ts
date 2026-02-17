@@ -191,11 +191,10 @@ export class DashboardServer {
       }
 
       const server = http.createServer((req, res) => {
-        // WebSocket upgrades are handled by server.on("upgrade") - skip them here
-        if (req.headers.upgrade === "websocket") {
-          return;
-        }
-
+        // WebSocket upgrades are handled by server.on("upgrade") event handler
+        // The HTTP request handler should only handle regular HTTP requests
+        // Note: WebSocket upgrade requests trigger the "upgrade" event, not this handler
+        
         // Check if dashboard dist directory exists
         if (distExists) {
           this.serveStaticFile(req, res);
