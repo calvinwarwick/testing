@@ -178,83 +178,68 @@ export class DashboardServer {
     }
   }
 
-  start(): boolean {
+  start(): Promise<boolean> {
     if (this.port <= 0) {
       console.warn(`Dashboard server not started: invalid port ${this.port}`);
-      return false;
+      return Promise.resolve(false);
     }
-    try {
-      // Verify dashboard dist path exists
-      const distExists = fs.existsSync(this.dashboardDistPath);
-      if (!distExists) {
-        console.warn(`Dashboard dist directory not found at: ${this.dashboardDistPath}`);
-        console.warn("Dashboard will not be served. Run 'npm run build:dashboard' to build it.");
-      } else {
-        console.log(`Dashboard dist directory found at: ${this.dashboardDistPath}`);
-      }
+    // Verify dashboard dist path exists
+    const distExists = fs.existsSync(this.dashboardDistPath);
+    if (!distExists) {
+      console.warn(`Dashboard dist directory not found at: ${this.dashboardDistPath}`);
+      console.warn("Dashboard will not be served. Run 'npm run build:dashboard' to build it.");
+    } else {
+      console.log(`Dashboard dist path: ${this.dashboardDistPath}`);
+    }
 
-      const server = http.createServer((req, res) => {
-        // WebSocket upgrades are handled by server.on("upgrade") event handler
-        // The HTTP request handler should only handle regular HTTP requests
-        // Note: WebSocket upgrade requests trigger the "upgrade" event, not this handler
-        
-        // Check if dashboard dist directory exists
-        if (distExists) {
-          this.serveStaticFile(req, res);
-        } else {
-          // Fallback if dashboard not built
-          res.writeHead(200, { "Content-Type": "text/plain" });
-          res.end("Dashboard not built. Run 'npm run build:dashboard' first.");
-        }
-      });
-      this.wss = new WebSocketServer({ noServer: true });
-      this.wss.on("connection", (ws) => {
-        this.clients.add(ws);
-        if (this.lastState) {
-          try {
-            ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
-          } catch (_) {}
-        }
-        ws.on("close", () => this.clients.delete(ws));
-        ws.on("error", () => this.clients.delete(ws));
-      });
-      server.on("upgrade", (req, socket, head) => {
-        this.wss!.handleUpgrade(req, socket, head, (ws) => {
-          this.wss!.emit("connection", ws, req);
+    return new Promise<boolean>((resolve, reject) => {
+      try {
+        const server = http.createServer((req, res) => {
+          if (distExists) {
+            this.serveStaticFile(req, res);
+          } else {
+            res.writeHead(200, { "Content-Type": "text/plain" });
+            res.end("Dashboard not built. Run 'npm run build:dashboard' first.");
+          }
         });
-      });
-      
-      // Bind to 0.0.0.0 so Railway (and other cloud proxies) can reach the server
-      server.listen(this.port, "0.0.0.0", () => {
-        console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
-      });
-      
-      this.httpServer = server;
-      this.httpServer.on("error", (err) => {
-        console.error(`Dashboard server error: ${err}`);
-        // Only stop if server was actually listening
-        if (this.httpServer && this.httpServer.listening) {
-          this.stop();
-        }
-      });
-      
-      // Give server a moment to start, then verify it's listening
-      setTimeout(() => {
-        if (this.httpServer && this.httpServer.listening) {
-          console.log(`Dashboard server confirmed listening on port ${this.port}`);
-        } else {
-          console.error(`Dashboard server failed to start listening on port ${this.port}`);
-        }
-      }, 100);
-      
-      // Return true if server was created successfully
-      // Note: server.listen() is synchronous and will throw if there's an immediate error
-      // The actual listening happens asynchronously, verified by the setTimeout above
-      return true;
-    } catch (err) {
-      console.error(`Dashboard server failed to start on port ${this.port}: ${err}`);
-      return false;
-    }
+        this.httpServer = server;
+        this.wss = new WebSocketServer({ noServer: true });
+        this.wss.on("connection", (ws) => {
+          this.clients.add(ws);
+          if (this.lastState) {
+            try {
+              ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
+            } catch (_) {}
+          }
+          ws.on("close", () => this.clients.delete(ws));
+          ws.on("error", () => this.clients.delete(ws));
+        });
+        server.on("upgrade", (req, socket, head) => {
+          this.wss!.handleUpgrade(req, socket, head, (ws) => {
+            this.wss!.emit("connection", ws, req);
+          });
+        });
+
+        // Attach error handler before listen so listen failures are caught
+        server.on("error", (err) => {
+          console.error(`Dashboard server error: ${err}`);
+          if (this.httpServer && this.httpServer.listening) {
+            this.stop();
+          } else {
+            // Listen failed (e.g. EADDRINUSE) – report startup failure
+            resolve(false);
+          }
+        });
+
+        server.listen(this.port, "0.0.0.0", () => {
+          console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
+          resolve(true);
+        });
+      } catch (err) {
+        console.error(`Dashboard server failed to start on port ${this.port}: ${err}`);
+        resolve(false);
+      }
+    });
   }
 
   stop(): void {

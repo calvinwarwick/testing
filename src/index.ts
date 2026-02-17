@@ -20,18 +20,19 @@ async function main(): Promise<void> {
   // Start dashboard FIRST using PORT from Railway (or DASHBOARD_WS_PORT for local dev)
   // This ensures dashboard is available even if config loading or bot startup fails
   const port = Number(process.env.PORT || process.env.DASHBOARD_WS_PORT || "8765") || 0;
+  logger.info(`Using PORT: ${port}`);
   let dashboard: DashboardServer | null = null;
   let dashboardStarted = false;
-  
+
   if (port > 0) {
     dashboard = new DashboardServer(port);
-    dashboardStarted = dashboard.start();
+    dashboardStarted = await dashboard.start();
     if (dashboardStarted) {
       setDashboardLogBroadcast((entry) => dashboard!.broadcastLog(entry));
       logger.info(`Dashboard server started on port ${port}`);
     } else {
       logger.error(`Dashboard server failed to start on port ${port}`);
-      dashboard = null; // Mark as failed
+      dashboard = null;
     }
   }
 
