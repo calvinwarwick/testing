@@ -97,6 +97,7 @@ function getLogCategory(entry: { level: string; message: string }): string {
     m.includes("lost") ||
     m.includes("stopped") ||
     m.includes("resolved") ||
+    m.includes("take-profit") ||
     m.includes("pnl=")
   )
     return "settlement";
@@ -144,6 +145,101 @@ function useTimeET() {
   return time;
 }
 
+/** Format bot start time (ms) as "Xd Xh Xm" run duration; updates every second via parent re-render */
+function formatBotRunTime(startTimeMs: number | undefined): string {
+  if (startTimeMs == null || !Number.isFinite(startTimeMs)) return "—";
+  const elapsedMs = Date.now() - startTimeMs;
+  if (elapsedMs < 0) return "—";
+  const totalSec = Math.floor(elapsedMs / 1000);
+  const totalMin = Math.floor(totalSec / 60);
+  const totalHr = Math.floor(totalMin / 60);
+  const days = Math.floor(totalHr / 24);
+  const hours = totalHr % 24;
+  const minutes = totalMin % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(" ");
+}
+
+type ExecutionLike = { settled: boolean; actualProfit: number; side: "UP" | "DOWN"; timestamp: number };
+
+/** In-depth stats derived from settled trades (chronological order for streaks) */
+function getTradingStats(list: ExecutionLike[]) {
+  const settled = list.filter((e) => e.settled);
+  const wins = settled.filter((e) => e.actualProfit > 0);
+  const losses = settled.filter((e) => e.actualProfit < 0);
+  const totalPnl = settled.reduce((s, e) => s + e.actualProfit, 0);
+  const grossProfit = wins.reduce((s, e) => s + e.actualProfit, 0);
+  const grossLoss = losses.reduce((s, e) => s + e.actualProfit, 0); // negative
+  const profitFactor =
+    grossLoss < 0 ? (grossProfit / Math.abs(grossLoss)) : (wins.length > 0 ? Infinity : 0);
+  const expectancy = settled.length > 0 ? totalPnl / settled.length : 0;
+  const winRatePct = settled.length > 0 ? (wins.length / settled.length) * 100 : 0;
+
+  const bySide = { UP: { count: 0, wins: 0, losses: 0, pnl: 0 }, DOWN: { count: 0, wins: 0, losses: 0, pnl: 0 } };
+  settled.forEach((e) => {
+    bySide[e.side].count++;
+    bySide[e.side].pnl += e.actualProfit;
+    if (e.actualProfit > 0) bySide[e.side].wins++;
+    else bySide[e.side].losses++;
+  });
+
+  const byTime = [...settled].sort((a, b) => a.timestamp - b.timestamp);
+  let maxWinStreak = 0;
+  let maxLossStreak = 0;
+  let curWin = 0;
+  let curLoss = 0;
+  byTime.forEach((e) => {
+    if (e.actualProfit > 0) {
+      curWin++;
+      curLoss = 0;
+      maxWinStreak = Math.max(maxWinStreak, curWin);
+    } else {
+      curLoss++;
+      curWin = 0;
+      maxLossStreak = Math.max(maxLossStreak, curLoss);
+    }
+  });
+
+  // Current streak: from most recent trade backwards
+  let currentStreak = 0;
+  let currentStreakType: "win" | "loss" | null = null;
+  for (let i = byTime.length - 1; i >= 0; i--) {
+    const isWin = byTime[i].actualProfit > 0;
+    if (currentStreakType === null) {
+      currentStreakType = isWin ? "win" : "loss";
+      currentStreak = 1;
+    } else if ((currentStreakType === "win" && isWin) || (currentStreakType === "loss" && !isWin)) {
+      currentStreak++;
+    } else break;
+  }
+
+  return {
+    settled,
+    wins,
+    losses,
+    totalWins: wins.length,
+    totalLosses: losses.length,
+    totalPnl,
+    grossProfit,
+    grossLoss,
+    profitFactor,
+    expectancy,
+    winRatePct,
+    bySide,
+    maxWinStreak,
+    maxLossStreak,
+    currentStreak,
+    currentStreakType,
+    maxWin: wins.length > 0 ? Math.max(...wins.map((e) => e.actualProfit)) : null,
+    maxLoss: losses.length > 0 ? Math.min(...losses.map((e) => e.actualProfit)) : null,
+    avgWin: wins.length > 0 ? grossProfit / wins.length : null,
+    avgLoss: losses.length > 0 ? grossLoss / losses.length : null,
+  };
+}
+
 const DEFAULT_PAGE_SIZE = 10;
 const POSITION_ROW_PX = 60;
 const POSITION_FOOTER_PX = 46;
@@ -164,9 +260,36 @@ function getChartDomain(points: Array<{ t: number }>): [number, number] | undefi
   return [first, first + delta];
 }
 
+const LOAD_TIMEOUT_MS = 8000;
+
 export default function App() {
   const { connected, state, logs, error, pnlHistory, btcHistory } =
     useBotConnection();
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (state != null) {
+      if (loadTimeoutRef.current != null) {
+        clearTimeout(loadTimeoutRef.current);
+        loadTimeoutRef.current = null;
+      }
+      setHasLoaded(true);
+      return;
+    }
+    if (loadTimeoutRef.current != null) return;
+    loadTimeoutRef.current = setTimeout(() => {
+      loadTimeoutRef.current = null;
+      setHasLoaded(true);
+    }, LOAD_TIMEOUT_MS);
+    return () => {
+      if (loadTimeoutRef.current != null) {
+        clearTimeout(loadTimeoutRef.current);
+        loadTimeoutRef.current = null;
+      }
+    };
+  }, [state]);
+
   const [positionsTab, setPositionsTab] = useState<PositionsTab>("open");
   const [positionsPage, setPositionsPage] = useState(0);
   const [positionsRowsPerPage, setPositionsRowsPerPage] = useState(
@@ -239,6 +362,14 @@ export default function App() {
           ((state.btcPrice - state.windowStartBtcPrice) / state.windowStartBtcPrice) *
             100
         ) / 0.15
+      : null;
+  const liveTargetAsk =
+    hasEdgeInputs && exchangeSignal != null
+      ? (exchangeSignal === "UP" ? state.currentMarketPrices!.up : state.currentMarketPrices!.down)
+      : null;
+  const liveKelly =
+    cexProbability != null && liveTargetAsk != null && liveTargetAsk < 1
+      ? Math.max(0, (cexProbability / 100 - liveTargetAsk) / (1 - liveTargetAsk))
       : null;
   const fiveMinAgo = Date.now() - FIVE_MIN_MS;
   const pnlChartData =
@@ -322,7 +453,25 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-bg-dark text-white flex flex-col">
+    <div className="h-screen w-screen overflow-hidden bg-bg-dark text-white flex flex-col relative">
+      {!hasLoaded && (
+        <div
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-bg-dark"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <div
+            className="w-10 h-10 border-2 border-edge border-t-primary rounded-full animate-spin"
+            aria-hidden
+          />
+          <span className="text-muted text-sm">Loading dashboard…</span>
+        </div>
+      )}
+      <div
+        className={`flex flex-col h-full w-full transition-opacity duration-500 ease-out ${
+          hasLoaded ? "opacity-100" : "opacity-0 pointer-events-none"
+        }`}
+      >
       {/* Header - match image: green dot, BTC price, PNL/TODAY green, WIN/TRADES white, OPEN orange, NEXT WINDOW + MARKET right */}
       <header className="flex items-center justify-between px-6 py-3 border-b border-edge bg-bg-panel shrink-0">
         <div className="flex items-center gap-2">
@@ -383,7 +532,7 @@ export default function App() {
           <div className="flex flex-col gap-0.5 items-center">
             <span className="text-muted text-[10px] uppercase tracking-wider text-center">Trades</span>
             <span className="font-mono text-primary text-sm">
-              {tradesExecuted.toLocaleString().replace(/,/g, " ")}
+              {tradesExecuted.toLocaleString()}
             </span>
           </div>
           <div className="flex flex-col gap-0.5 items-center">
@@ -397,7 +546,13 @@ export default function App() {
             <span
               className={`font-mono font-medium text-sm ${avgTrade >= 0 ? "text-positive" : "text-negative"}`}
             >
-              {avgTrade >= 0 ? "+" : ""}${avgTrade.toFixed(2)}
+              {avgTrade >= 0 ? "+" : ""}${avgTrade.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+          <div className="flex flex-col gap-0.5 items-center">
+            <span className="text-muted text-[10px] uppercase tracking-wider text-center">Uptime</span>
+            <span className="font-mono text-primary text-sm">
+              {formatBotRunTime(state?.stats?.startTime)}
             </span>
           </div>
         </div>
@@ -416,27 +571,27 @@ export default function App() {
       <main className="flex-1 flex min-h-0 overflow-hidden">
         <div className="flex-1 min-w-0 overflow-auto grid grid-cols-12 gap-0 auto-rows-auto">
         {/* Left: Cumulative PNL – all time */}
-        <section className="col-span-4 bg-bg-panel border-r border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-1">
+        <section className="col-span-4 bg-bg-panel border-r border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-1 px-4">
             CUMULATIVE PNL (ALL TIME)
           </h2>
-          <div className="font-mono text-3xl font-medium text-primary mb-0.5">
+          <div className="font-mono text-3xl font-medium text-primary mb-0.5 px-4">
             {formatUsd(totalProfit)}
           </div>
           <div
-            className={`text-sm font-mono mb-1 ${dailyPnL >= 0 ? "text-positive" : "text-negative"}`}
+            className={`px-4 text-sm font-mono mb-1 ${dailyPnL >= 0 ? "text-positive" : "text-negative"}`}
           >
             {dailyPnL >= 0 ? "+" : ""}
             {formatUsd(dailyPnL)} today
           </div>
           <div
-            className={`text-sm font-mono mb-3 ${pctGained != null ? (pctGained >= 0 ? "text-positive" : "text-negative") : "text-muted"}`}
+            className={`px-4 text-sm font-mono mb-3 ${pctGained != null ? (pctGained >= 0 ? "text-positive" : "text-negative") : "text-muted"}`}
           >
             {pctGained != null
               ? `${pctGained >= 0 ? "+" : ""}${pctGained.toFixed(1)}%`
               : "—"}
           </div>
-          <div className="flex-1 min-h-[140px]">
+          <div className="flex-1 min-h-[140px] px-4">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
                 data={pnlChartSeries}
@@ -457,12 +612,12 @@ export default function App() {
         </section>
 
         {/* Middle: BTC/USD – last 5 min live */}
-        <section className="col-span-4 bg-bg-panel border-r border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-1">
+        <section className="col-span-4 bg-bg-panel border-r border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-1 px-4">
             BTC/USD (5M LIVE)
           </h2>
           <div
-            className={`font-mono text-3xl font-medium mb-2 inline-flex items-center ${
+            className={`px-4 font-mono text-3xl font-medium mb-2 inline-flex items-center ${
               btcDirection === "up"
                 ? "text-positive"
                 : btcDirection === "down"
@@ -483,7 +638,7 @@ export default function App() {
               </>
             ) : "—"}
           </div>
-          <div className="flex-1 min-h-[140px]">
+          <div className="flex-1 min-h-[140px] px-4">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
                 data={btcChartSeries}
@@ -509,8 +664,8 @@ export default function App() {
         </section>
 
         {/* Last 10 resolved 5min BTC markets (UP/DOWN) - from Polymarket */}
-        <section className="col-span-4 bg-bg-panel border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
+        <section className="col-span-4 bg-bg-panel border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-2 px-4">
             HISTORICAL MARKETS
           </h2>
           <div className="flex-1 overflow-y-auto min-h-0">
@@ -521,7 +676,7 @@ export default function App() {
                 .slice(0, 8);
               if (last8.length === 0) {
                 return (
-                  <div className="py-4 text-center text-muted text-sm">
+                  <div className="py-4 text-center text-muted text-sm px-4">
                     Waiting for resolved markets feed...
                   </div>
                 );
@@ -531,21 +686,23 @@ export default function App() {
                   {last8.map((m) => (
                     <li
                       key={m.windowEnd}
-                      className="flex items-center justify-between py-2.5 pl-2 border-b border-edge last:border-0"
+                      className="border-b border-edge last:border-0"
                     >
-                      <span
-                        className="font-mono tabular-nums text-sm font-medium"
-                        style={{ color: "#a1a1aa" }}
-                      >
-                        {formatWindowEndTime(m.windowEnd)}
-                      </span>
-                      <span
-                        className={`font-mono text-sm font-medium shrink-0 pr-2 ${
-                          m.outcome === "UP" ? "text-positive" : "text-negative"
-                        }`}
-                      >
-                        {m.outcome === "UP" ? "▲" : "▼"}
-                      </span>
+                      <div className="flex items-center justify-between py-2.5 px-4">
+                        <span
+                          className="font-mono tabular-nums text-sm font-medium"
+                          style={{ color: "#a1a1aa" }}
+                        >
+                          {formatWindowEndTime(m.windowEnd)}
+                        </span>
+                        <span
+                          className={`font-mono text-sm font-medium shrink-0 ${
+                            m.outcome === "UP" ? "text-positive" : "text-negative"
+                          }`}
+                        >
+                          {m.outcome === "UP" ? "▲" : "▼"}
+                        </span>
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -555,11 +712,11 @@ export default function App() {
         </section>
 
         {/* CEX Feeds */}
-        <section className="col-span-4 bg-bg-panel border-r border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
+        <section className="col-span-2 bg-bg-panel border-r border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-2 px-4">
             CEX FEEDS
           </h2>
-          <div className="font-mono text-sm text-primary space-y-1">
+          <div className="font-mono text-sm text-primary space-y-0">
             {(state?.cexPrices && Object.keys(state.cexPrices).length > 0
               ? CEX_ORDER.filter((name) => state!.cexPrices[name] != null).map((name) => ({
                   name,
@@ -569,25 +726,88 @@ export default function App() {
             ).map((c) => (
               <div
                 key={c.name}
-                className="flex items-center justify-between gap-4 py-1.5 border-b border-edge last:border-0"
+                className="border-b border-edge last:border-0"
               >
-                <span className="text-muted shrink-0">{capitalize(c.name)}</span>
-                <span className="tabular-nums text-primary font-medium truncate">
-                  ${formatCexPrice(typeof c.price === "number" ? c.price : 0)}
-                </span>
+                <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                  <span className="text-muted shrink-0">{capitalize(c.name)}</span>
+                  <span className="tabular-nums text-primary font-medium truncate">
+                    ${formatCexPrice(typeof c.price === "number" ? c.price : 0)}
+                  </span>
+                </div>
               </div>
             ))}
           </div>
         </section>
 
+        {/* EDGE calculations */}
+        <section className="col-span-2 bg-bg-panel border-r border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-2 px-4">
+            EDGE
+          </h2>
+          <div className="font-mono text-sm text-primary space-y-0">
+            <div className="border-b border-edge">
+              <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                <span className="text-muted shrink-0">cex</span>
+                <span className="tabular-nums text-primary font-medium">
+                  {cexProbability != null ? `${cexProbability.toFixed(1)}%` : "—"}
+                </span>
+              </div>
+            </div>
+            <div className="border-b border-edge">
+              <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                <span className="text-muted shrink-0">pm</span>
+                <span className="tabular-nums text-primary font-medium">
+                  {polymarketProbability != null
+                    ? `${polymarketProbability.toFixed(1)}%`
+                    : "—"}
+                </span>
+              </div>
+            </div>
+            <div className="border-b border-edge">
+              <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                <span className="text-muted shrink-0">edge</span>
+                <span
+                  className={`tabular-nums font-medium ${
+                    edgePercent == null
+                      ? "text-primary"
+                      : edgePercent >= 0
+                        ? "text-positive"
+                        : "text-negative"
+                  }`}
+                >
+                  {edgePercent != null
+                    ? `${edgePercent >= 0 ? "+" : ""}${edgePercent.toFixed(1)}%`
+                    : "—"}
+                </span>
+              </div>
+            </div>
+            <div className="border-b border-edge">
+              <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                <span className="text-muted shrink-0">σ</span>
+                <span className="tabular-nums text-primary font-medium">
+                  {sigma != null ? sigma.toFixed(1) : "—"}
+                </span>
+              </div>
+            </div>
+            <div>
+              <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                <span className="text-muted shrink-0">Kelly</span>
+                <span className="tabular-nums text-primary font-medium">
+                  {liveKelly != null ? `${(liveKelly * 100).toFixed(1)}%` : "—"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
         {/* Current market window: start price, window info, UP/DOWN */}
-        <section className="col-span-4 bg-bg-panel border-r border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
+        <section className="col-span-4 bg-bg-panel border-r border-b border-edge py-2 flex flex-col min-h-0">
+          <h2 className="text-edge text-xs uppercase tracking-wider mb-2 px-4">
             CURRENT WINDOW
           </h2>
-          <div className="font-mono text-sm text-primary space-y-1">
+          <div className="font-mono text-sm text-primary space-y-0">
             {!hasLiveMarketData ? (
-              <div className="py-2 text-muted text-sm space-y-1">
+              <div className="py-2 text-muted text-sm space-y-1 px-4">
                 <p className="font-medium text-negative">Live market data unavailable.</p>
                 <p className="text-xs">
                   Bot is currently using simulation mode
@@ -596,56 +816,68 @@ export default function App() {
               </div>
             ) : state?.windowStartTime != null && state?.windowEndTime != null ? (
               <>
-                <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-                  <span className="text-muted shrink-0">Starting price</span>
-                  <span className="tabular-nums text-primary font-medium">
-                    {state.windowStartBtcPrice != null
-                      ? formatUsdSmall(state.windowStartBtcPrice)
-                      : "—"}
-                  </span>
+                <div className="border-b border-edge">
+                  <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                    <span className="text-muted shrink-0">Starting price</span>
+                    <span className="tabular-nums text-primary font-medium">
+                      {state.windowStartBtcPrice != null
+                        ? formatUsdSmall(state.windowStartBtcPrice)
+                        : "—"}
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-                  <span className="text-muted shrink-0">Window</span>
-                  <span className="tabular-nums text-primary">
-                    {formatWindowRange(state.windowStartTime, state.windowEndTime)}
-                  </span>
+                <div className="border-b border-edge">
+                  <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                    <span className="text-muted shrink-0">Window</span>
+                    <span className="tabular-nums text-primary">
+                      {formatWindowRange(state.windowStartTime, state.windowEndTime)}
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-                  <span className="text-muted shrink-0">Time left</span>
-                  <span className="tabular-nums text-primary">
-                    {formatRemaining(liveWindowRemainingSec)}
-                  </span>
+                <div className="border-b border-edge">
+                  <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                    <span className="text-muted shrink-0">Time left</span>
+                    <span className="tabular-nums text-primary">
+                      {formatRemaining(liveWindowRemainingSec)}
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-                  <span className="text-muted shrink-0">Market volume</span>
-                  <span className="tabular-nums text-primary font-medium">
-                    {state.marketVolume != null ? formatUsd(state.marketVolume) : "—"}
-                  </span>
+                <div className="border-b border-edge">
+                  <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                    <span className="text-muted shrink-0">Market volume</span>
+                    <span className="tabular-nums text-primary font-medium">
+                      {state.marketVolume != null ? formatUsd(state.marketVolume) : "—"}
+                    </span>
+                  </div>
                 </div>
                 {state.currentMarketPrices != null && (
                   <>
-                    <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-                      <span className="text-muted shrink-0">UP</span>
-                      <span className="tabular-nums text-positive font-medium">
-                        ${state.currentMarketPrices.up.toFixed(2)}
-                      </span>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">UP</span>
+                        <span className="tabular-nums text-positive font-medium">
+                          ${state.currentMarketPrices.up.toFixed(2)}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge last:border-0">
-                      <span className="text-muted shrink-0">DOWN</span>
-                      <span className="tabular-nums text-negative font-medium">
-                        ${state.currentMarketPrices.down.toFixed(2)}
-                      </span>
+                    <div className="border-b border-edge last:border-0">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">DOWN</span>
+                        <span className="tabular-nums text-negative font-medium">
+                          ${state.currentMarketPrices.down.toFixed(2)}
+                        </span>
+                      </div>
                     </div>
                   </>
                 )}
                 {state.currentMarketPrices == null && (
-                  <div className="py-1.5 text-muted text-xs">
+                  <div className="py-1.5 text-muted text-xs px-4">
                     No order book yet for this window.
                   </div>
                 )}
               </>
             ) : (
-              <div className="py-2 text-muted text-sm space-y-1">
+              <div className="py-2 text-muted text-sm space-y-1 px-4">
                 <p className="font-medium text-primary">No active window.</p>
                 <p className="text-xs">
                   Connect the bot (npm run dev, DASHBOARD_WS_PORT=8765) and ensure it has discovered active 5‑min BTC markets.
@@ -655,54 +887,117 @@ export default function App() {
           </div>
         </section>
 
-        {/* EDGE calculations */}
-        <section className="col-span-4 bg-bg-panel border-b border-edge p-2 flex flex-col min-h-0">
-          <h2 className="text-edge text-xs uppercase tracking-wider mb-2">
-            EDGE
-          </h2>
-          <div className="font-mono text-sm text-primary space-y-1">
-            <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-              <span className="text-muted shrink-0">cex</span>
-              <span className="tabular-nums text-primary font-medium">
-                {cexProbability != null ? `${cexProbability.toFixed(1)}%` : "—"}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-              <span className="text-muted shrink-0">pm</span>
-              <span className="tabular-nums text-primary font-medium">
-                {polymarketProbability != null
-                  ? `${polymarketProbability.toFixed(1)}%`
-                  : "—"}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-4 py-1.5 border-b border-edge">
-              <span className="text-muted shrink-0">edge</span>
-              <span
-                className={`tabular-nums font-medium ${
-                  edgePercent == null
-                    ? "text-primary"
-                    : edgePercent >= 0
-                      ? "text-positive"
-                      : "text-negative"
-                }`}
-              >
-                {edgePercent != null
-                  ? `${edgePercent >= 0 ? "+" : ""}${edgePercent.toFixed(1)}%`
-                  : "—"}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-4 py-1.5">
-              <span className="text-muted shrink-0">σ</span>
-              <span className="tabular-nums text-primary font-medium">
-                {sigma != null ? sigma.toFixed(1) : "—"}
-              </span>
-            </div>
-          </div>
-        </section>
+        {/* Trading stats (spans 2 rows) */}
+        {(() => {
+          const list = state?.tradeHistory ?? state?.executions ?? [];
+          const s = getTradingStats(list);
+          const hasSettled = s.settled.length > 0;
+          return (
+            <section className="col-span-4 row-span-2 bg-bg-panel border-b border-edge py-2 flex flex-col min-h-0">
+              <h2 className="text-edge text-xs uppercase tracking-wider mb-2 px-4">
+                TRADING STATS
+              </h2>
+              <div className="font-mono text-sm text-primary space-y-0 overflow-y-auto min-h-0 flex-1">
+                {!hasSettled ? (
+                  <div className="py-4 text-center text-muted text-sm px-4">No settled trades yet.</div>
+                ) : (
+                  <>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Wins</span>
+                        <span className="tabular-nums text-primary font-medium">{s.totalWins}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Losses</span>
+                        <span className="tabular-nums text-primary font-medium">{s.totalLosses}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Max win</span>
+                        <span className="tabular-nums text-primary font-medium">{s.maxWin != null ? `+${formatUsdSmall(s.maxWin)}` : "—"}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Max loss</span>
+                        <span className="tabular-nums text-primary font-medium">{s.maxLoss != null ? formatUsdSmall(s.maxLoss) : "—"}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Avg win</span>
+                        <span className="tabular-nums text-primary font-medium">{s.avgWin != null ? `+${formatUsdSmall(s.avgWin)}` : "—"}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Avg loss</span>
+                        <span className="tabular-nums text-primary font-medium">{s.avgLoss != null ? formatUsdSmall(s.avgLoss) : "—"}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Total PnL</span>
+                        <span className="tabular-nums text-primary font-medium">{s.totalPnl >= 0 ? "+" : ""}{formatUsdSmall(s.totalPnl)}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Profit factor</span>
+                        <span className="tabular-nums text-primary font-medium">{s.grossLoss < 0 ? (s.profitFactor >= 99.99 ? "∞" : s.profitFactor.toFixed(2)) : (s.wins.length > 0 ? "∞" : "—")}</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Expectancy</span>
+                        <span className="tabular-nums text-primary font-medium">{s.expectancy >= 0 ? "+" : ""}{formatUsdSmall(s.expectancy)} / trade</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Current streak</span>
+                        <span className="tabular-nums text-primary font-medium">
+                          {s.settled.length === 0 ? "—" : `${s.currentStreak} ${s.currentStreakType === "win" ? "wins" : "losses"}`}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Best streak</span>
+                        <span className="tabular-nums text-primary font-medium">{s.maxWinStreak} wins</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">Worst streak</span>
+                        <span className="tabular-nums text-primary font-medium">{s.maxLossStreak} losses</span>
+                      </div>
+                    </div>
+                    <div className="border-b border-edge">
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">UP PnL</span>
+                        <span className="tabular-nums text-primary font-medium">{s.bySide.UP.pnl >= 0 ? "+" : ""}{formatUsdSmall(s.bySide.UP.pnl)} ({s.bySide.UP.wins}/{s.bySide.UP.count})</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between gap-4 py-1.5 px-4">
+                        <span className="text-muted shrink-0">DOWN PnL</span>
+                        <span className="tabular-nums text-primary font-medium">{s.bySide.DOWN.pnl >= 0 ? "+" : ""}{formatUsdSmall(s.bySide.DOWN.pnl)} ({s.bySide.DOWN.wins}/{s.bySide.DOWN.count})</span>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </section>
+          );
+        })()}
 
-        {/* Logs (left half) */}
-        <section className="col-span-6 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0">
-          <div className="flex items-center justify-between p-2 pb-1">
+        {/* Logs (left 2/3 of row; combined section fills right 1/3 via row-span) */}
+        <section className="col-span-8 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0 border-b border-edge">
+          <div className="flex items-center justify-between px-4 py-2 pb-1">
             <h2 className="text-edge text-xs uppercase tracking-wider">
               LIVE LOGS ({logs.length}/1000) {!connected && "(disconnected)"}
             </h2>
@@ -771,61 +1066,11 @@ export default function App() {
           </div>
         </section>
 
-        {/* Last 5 markets: Chainlink BTC start/end (compare with Polymarket) */}
-        <section className="col-span-6 bg-bg-panel flex flex-col min-h-0 h-[280px] shrink-0 border-l border-edge">
-          <div className="p-2 pb-1">
-            <h2 className="text-edge text-xs uppercase tracking-wider">
-              Last 5 markets (Chainlink BTC start / end)
-            </h2>
-          </div>
-          <div
-            className="flex-1 overflow-auto p-2 pt-1 font-mono text-[11px] min-h-0 bg-bg-dark/40 text-muted"
-            style={{ fontFamily: "JetBrains Mono, monospace" }}
-          >
-            {(() => {
-              const payload = state?.polymarketApiOutput as { lastFiveMarkets?: Array<{ slug: string; btcStartPrice?: number; btcEndPrice?: number }> } | null | undefined;
-              const list = payload?.lastFiveMarkets;
-              if (list && list.length > 0) {
-                const usd = (n: number | undefined) => (n != null ? `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—");
-                return (
-                  <table className="w-full text-[11px] border-collapse">
-                    <thead>
-                      <tr className="text-edge border-b border-edge">
-                        <th className="text-left py-1 pr-2 font-medium">Market ID</th>
-                        <th className="text-right py-1 px-1 font-medium">BTC start</th>
-                        <th className="text-right py-1 pl-1 font-medium">BTC end</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {list.map((row) => (
-                        <tr key={row.slug} className="border-b border-edge/50 text-primary">
-                          <td className="py-0.5 pr-2 truncate max-w-[180px]" title={row.slug}>
-                            {row.slug}
-                          </td>
-                          <td className="text-right py-0.5 px-1 tabular-nums">{usd(row.btcStartPrice)}</td>
-                          <td className="text-right py-0.5 pl-1 tabular-nums">{usd(row.btcEndPrice)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                );
-              }
-              return (
-                <span className="text-muted">
-                  {connected
-                    ? "Waiting for last 5 markets…"
-                    : "Disconnected — no data."}
-                </span>
-              );
-            })()}
-          </div>
-        </section>
-
         </div>
 
         {/* Right: Positions - full height */}
         <section className="w-[min(420px,40vw)] shrink-0 border-l border-edge bg-bg-panel flex flex-col min-h-0">
-          <div className="flex items-center justify-between p-2 border-b border-edge">
+          <div className="flex items-center justify-between px-4 py-2 border-b border-edge">
             <h2 className="text-edge text-xs uppercase tracking-wider">
               POSITIONS
             </h2>
@@ -916,10 +1161,12 @@ export default function App() {
                       return (
                         <div
                           key={(e as { id?: string }).id ?? `${e.marketSlug}-${e.timestamp}-${e.side}-${i}`}
-                          className="flex items-center justify-between py-2.5 px-3 border-b border-edge last:border-0"
+                          className="border-b border-edge last:border-0"
                           style={{
                             borderLeft: `3px solid ${e.side === "UP" ? "#22c55e" : "#ef4444"}`,
                           }}
+                        >
+                        <div className="flex items-center justify-between py-2.5 px-4"
                         >
                           <div className="flex flex-col gap-0.5 min-w-0 flex-1">
                             <div className="flex items-center gap-2 flex-wrap">
@@ -935,16 +1182,18 @@ export default function App() {
                               </span>
                             </div>
                             <div className="flex items-center gap-2 text-muted text-xs font-mono">
-                              <span>Entry {formatUsdSmall(entryUsd)}</span>
-                              <span>Cost {formatUsdSmall(orderValue)}</span>
-                              <span className={e.settled ? "text-positive" : ""}>
+                              <span>{formatUsdSmall(orderValue)} @ {formatUsdSmall(entryUsd)}</span>
+                              <span className="text-gray-600">|</span>
+                              <span className={e.lossCapped ? "text-negative" : (e.profitTaken || e.settled) ? "text-positive" : ""}>
                                 {e.lossCapped
-                                  ? "Stopped"
-                                  : e.settled
-                                    ? "resolved ✓"
-                                    : e.fullyExecuted
-                                      ? "open"
-                                      : "partial"}
+                                  ? "Stopped X"
+                                  : e.profitTaken
+                                    ? "Profit \u2713"
+                                    : e.settled
+                                      ? "Resolved \u2713"
+                                      : e.fullyExecuted
+                                        ? "Open"
+                                        : "partial"}
                               </span>
                             </div>
                           </div>
@@ -954,9 +1203,11 @@ export default function App() {
                               title={
                                 showLive
                                   ? "Live (mark-to-market)"
-                                  : e.lossCapped
-                                    ? "Stopped at 5% loss (position exited early; full loss if held to resolution)"
-                                    : undefined
+                                  : e.profitTaken
+                                    ? "Trailing take-profit (profit locked in before window end)"
+                                    : e.lossCapped
+                                      ? "Stopped at 5% loss (position exited early; full loss if held to resolution)"
+                                      : undefined
                               }
                             >
                               {displayProfit >= 0 ? "+" : ""}
@@ -964,10 +1215,11 @@ export default function App() {
                             </span>
                           </div>
                         </div>
+                        </div>
                       );
                     })}
                   </div>
-                  <div className="flex items-center justify-between px-3 py-2 border-t border-edge shrink-0">
+                  <div className="flex items-center justify-between px-4 py-2 border-t border-edge shrink-0">
                     <span className="text-muted text-xs">
                       Page {page + 1} of {totalPages} ({displayList.length} total)
                     </span>
@@ -996,6 +1248,7 @@ export default function App() {
           </div>
         </section>
       </main>
+      </div>
     </div>
   );
 }
