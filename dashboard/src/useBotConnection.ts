@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const WS_PORT = "8765";
+// WebSocket URL: use VITE_WS_URL if set, otherwise construct from current location
+// In production (Railway), WebSocket uses same hostname/port as HTTP (wss:// for HTTPS, ws:// for HTTP)
 const WS_URL =
   import.meta.env.VITE_WS_URL ||
   (typeof window !== "undefined"
-    ? `ws://${window.location.hostname}:${WS_PORT}`
-    : `ws://localhost:${WS_PORT}`);
+    ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname}${window.location.port ? `:${window.location.port}` : ""}`
+    : `ws://localhost:8765`);
 const MAX_LOGS = 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 const MAX_BTC_POINTS_5M = 60; // ~1 point per 5s over 5m
@@ -36,6 +37,7 @@ export interface BotState {
   btcPrice: number | null;
   btcTimestamp: number;
   cexPrices: Record<string, number>;
+  cexWindowStartPrices?: Record<string, number>;
   /** Current 5-min market UP (YES) and DOWN (NO) best ask prices (0–1) */
   currentMarketPrices?: { up: number; down: number };
   /** Current market data source mode. */
@@ -85,13 +87,14 @@ export interface BotState {
     unrealizedProfit: number | null;
     lossCapped?: boolean;
     id?: string;
+    kellyFraction?: number;
+    estimatedWinProbability?: number;
+    profitTaken?: boolean;
   }>;
   /** Full history of all trades from persisted log (newest first), for Closed tab */
   tradeHistory?: BotState["executions"];
   /** Historical markets from persistent storage */
   historicalMarkets?: HistoricalMarket[];
-  /** Raw Polymarket API responses for current market (Gamma + CLOB), for testing */
-  polymarketApiOutput?: unknown;
 }
 
 export interface LogEntry {
@@ -128,12 +131,7 @@ export function useBotConnection() {
         const msg = JSON.parse(event.data as string);
         if (msg.type === "state") {
           const s = msg.payload as BotState;
-          const payload = s.polymarketApiOutput as { lastFiveMarkets?: unknown[] } | undefined;
-          const hasLastFive = Array.isArray(payload?.lastFiveMarkets) && payload.lastFiveMarkets.length > 0;
-          setState((prev) => ({
-            ...s,
-            polymarketApiOutput: hasLastFive ? s.polymarketApiOutput : (prev?.polymarketApiOutput ?? s.polymarketApiOutput),
-          }));
+          setState(s);
           if (Array.isArray(s.recentLogs) && s.recentLogs.length > 0) {
             setLogs((prev) =>
               prev.length > 0

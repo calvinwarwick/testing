@@ -1,5 +1,7 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
+import * as fs from "fs";
+import * as path from "path";
 
 /** Historical market record */
 export interface HistoricalMarketRecord {
@@ -17,6 +19,8 @@ export interface DashboardState {
   btcTimestamp: number;
   /** Per-exchange BTC prices (binance, coinbase, okx, bybit, kraken, bitfinex) */
   cexPrices: Record<string, number>;
+  /** Per-exchange BTC prices at window start (binance, coinbase, okx, bybit, kraken, bitfinex) */
+  cexWindowStartPrices?: Record<string, number>;
   /** Current 5-min market YES (UP) and NO (DOWN) best ask prices (0–1) */
   currentMarketPrices?: { up: number; down: number };
   /** Current market data source mode. */
@@ -70,13 +74,17 @@ export interface DashboardState {
     lossCapped?: boolean;
     /** Optional stable id (e.g. from persisted trade record) for list keys */
     id?: string;
+    /** Kelly Criterion fraction used for sizing */
+    kellyFraction?: number;
+    /** Estimated win probability at entry */
+    estimatedWinProbability?: number;
+    /** True when position was exited by trailing take-profit */
+    profitTaken?: boolean;
   }>;
   /** Full history of all trades from persisted log (newest first), for Closed tab */
   tradeHistory?: DashboardState["executions"];
   /** Historical markets (last 100) */
   historicalMarkets?: HistoricalMarketRecord[];
-  /** Raw Polymarket API responses for current market (Gamma + CLOB), for testing */
-  polymarketApiOutput?: unknown;
 }
 
 export interface DashboardLogEntry {
@@ -91,15 +99,89 @@ export class DashboardServer {
   private wss: WebSocketServer | null = null;
   private clients: Set<WebSocket> = new Set();
   private lastState: DashboardState | null = null;
+  private dashboardDistPath: string;
 
-  constructor(private port: number) {}
+  constructor(private port: number) {
+    // Path to built dashboard static files
+    this.dashboardDistPath = path.join(__dirname, "../../dashboard/dist");
+  }
+
+  private serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse): void {
+    let filePath = req.url || "/";
+    
+    // Handle WebSocket upgrade requests
+    if (req.headers.upgrade === "websocket") {
+      return;
+    }
+
+    // Default to index.html for root or non-file requests
+    if (filePath === "/" || !filePath.includes(".")) {
+      filePath = "/index.html";
+    }
+
+    // Remove query string
+    const cleanPath = filePath.split("?")[0];
+    const fullPath = path.join(this.dashboardDistPath, cleanPath);
+
+    // Security: prevent directory traversal
+    if (!fullPath.startsWith(this.dashboardDistPath)) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Forbidden");
+      return;
+    }
+
+    // Check if file exists
+    if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+      // Fallback to index.html for SPA routing
+      const indexPath = path.join(this.dashboardDistPath, "index.html");
+      if (fs.existsSync(indexPath)) {
+        const content = fs.readFileSync(indexPath);
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(content);
+      } else {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Not Found");
+      }
+      return;
+    }
+
+    // Determine content type
+    const ext = path.extname(fullPath).toLowerCase();
+    const contentTypes: Record<string, string> = {
+      ".html": "text/html",
+      ".js": "application/javascript",
+      ".css": "text/css",
+      ".json": "application/json",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".svg": "image/svg+xml",
+      ".ico": "image/x-icon",
+      ".woff": "font/woff",
+      ".woff2": "font/woff2",
+      ".ttf": "font/ttf",
+      ".eot": "application/vnd.ms-fontobject",
+    };
+
+    const contentType = contentTypes[ext] || "application/octet-stream";
+    const content = fs.readFileSync(fullPath);
+    res.writeHead(200, { "Content-Type": contentType });
+    res.end(content);
+  }
 
   start(): void {
     if (this.port <= 0) return;
     try {
       const server = http.createServer((req, res) => {
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("ok");
+        // Check if dashboard dist directory exists
+        if (fs.existsSync(this.dashboardDistPath)) {
+          this.serveStaticFile(req, res);
+        } else {
+          // Fallback if dashboard not built
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("Dashboard not built. Run 'npm run build:dashboard' first.");
+        }
       });
       this.wss = new WebSocketServer({ noServer: true });
       this.wss.on("connection", (ws) => {

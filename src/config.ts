@@ -32,26 +32,20 @@ export function loadConfig(): BotConfig {
     polygonRpcUrl: optionalEnv("POLYGON_RPC_URL", "https://polygon-rpc.com"),
     binanceApiKey: optionalEnv("BINANCE_API_KEY", ""),
     binanceApiSecret: optionalEnv("BINANCE_API_SECRET", ""),
-    minProfitThresholdCents: Number(
-      optionalEnv("MIN_PROFIT_THRESHOLD_CENTS", "2")
-    ),
     maxPositionSizeUsdc: Number(optionalEnv("MAX_POSITION_SIZE_USDC", "100")),
     pollIntervalMs: Number(optionalEnv("POLL_INTERVAL_MS", "1000")),
     dryRun,
     btc5mEventSlug: optionalEnv("POLYMARKET_BTC_5M_EVENT_SLUG", "") || undefined,
-    dashboardWsPort: Number(process.env.PORT ?? optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
-    maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "20")) || 20),
+    // Use PORT env var (Railway) or DASHBOARD_WS_PORT for local dev
+    // PORT is used for both HTTP (serving dashboard) and WebSocket
+    dashboardWsPort: Number(process.env.PORT || optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
+    maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "50")) || 50),
     sessionFile: optionalEnv("SESSION_FILE", "data/session.json") || undefined,
-    maxProfitPercentBeforeSuspicious: Math.max(
-      10,
-      Number(optionalEnv("MAX_PROFIT_PERCENT_BEFORE_SUSPICIOUS", "50")) || 50
-    ),
     minTimeBetweenTradesMs: Math.max(
       0,
       Number(optionalEnv("MIN_TIME_BETWEEN_TRADES_MS", "2000")) || 2000
     ),
-    maxTradesPerMinute: Math.max(1, Number(optionalEnv("MAX_TRADES_PER_MINUTE", "20")) || 20),
-    pureArbOnly: optionalEnv("PURE_ARB_ONLY", "false") === "true",
+    maxTradesPerMinute: Math.max(1, Number(optionalEnv("MAX_TRADES_PER_MINUTE", "50")) || 50),
     directionalOnly: optionalEnv("DIRECTIONAL_ONLY", "true") === "true",
     minEdgePercent: Math.max(1, Math.min(50, Number(optionalEnv("MIN_EDGE_PERCENT", "8")) || 8)),
     exchangeSignalThresholdPercent: Math.max(0.01, Math.min(1, Number(optionalEnv("EXCHANGE_SIGNAL_THRESHOLD_PERCENT", "0.03")) || 0.03)),
@@ -62,6 +56,7 @@ export function loadConfig(): BotConfig {
     chainlinkDsApiKey: optionalEnv("CHAINLINK_DS_API_KEY", "") || undefined,
     chainlinkDsApiSecret: optionalEnv("CHAINLINK_DS_API_SECRET", "") || undefined,
     chainlinkBtcUsdFeedId: optionalEnv("CHAINLINK_BTC_USD_FEED_ID", "") || undefined,
+    kellyMultiplier: Math.max(0.05, Math.min(1.0, Number(optionalEnv("KELLY_MULTIPLIER", "0.25")) || 0.25)),
   };
   return config;
 }
