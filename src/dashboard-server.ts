@@ -103,16 +103,12 @@ export class DashboardServer {
 
   constructor(private port: number) {
     // Path to built dashboard static files
-    this.dashboardDistPath = path.join(__dirname, "../../dashboard/dist");
+    // When running from dist/index.js, __dirname is dist/, so ../dashboard/dist goes up one level to project root
+    this.dashboardDistPath = path.resolve(__dirname, "../dashboard/dist");
   }
 
   private serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse): void {
     let filePath = req.url || "/";
-    
-    // Handle WebSocket upgrade requests
-    if (req.headers.upgrade === "websocket") {
-      return;
-    }
 
     // Default to index.html for root or non-file requests
     if (filePath === "/" || !filePath.includes(".")) {
@@ -135,9 +131,15 @@ export class DashboardServer {
       // Fallback to index.html for SPA routing
       const indexPath = path.join(this.dashboardDistPath, "index.html");
       if (fs.existsSync(indexPath)) {
-        const content = fs.readFileSync(indexPath);
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(content);
+        try {
+          const content = fs.readFileSync(indexPath);
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(content);
+        } catch (err) {
+          console.warn(`Failed to read index.html: ${err}`);
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Internal Server Error");
+        }
       } else {
         res.writeHead(404, { "Content-Type": "text/plain" });
         res.end("Not Found");
@@ -165,17 +167,37 @@ export class DashboardServer {
     };
 
     const contentType = contentTypes[ext] || "application/octet-stream";
-    const content = fs.readFileSync(fullPath);
-    res.writeHead(200, { "Content-Type": contentType });
-    res.end(content);
+    try {
+      const content = fs.readFileSync(fullPath);
+      res.writeHead(200, { "Content-Type": contentType });
+      res.end(content);
+    } catch (err) {
+      console.warn(`Failed to read file ${fullPath}: ${err}`);
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Internal Server Error");
+    }
   }
 
   start(): void {
     if (this.port <= 0) return;
     try {
+      // Verify dashboard dist path exists
+      const distExists = fs.existsSync(this.dashboardDistPath);
+      if (!distExists) {
+        console.warn(`Dashboard dist directory not found at: ${this.dashboardDistPath}`);
+        console.warn("Dashboard will not be served. Run 'npm run build:dashboard' to build it.");
+      } else {
+        console.log(`Dashboard dist directory found at: ${this.dashboardDistPath}`);
+      }
+
       const server = http.createServer((req, res) => {
+        // WebSocket upgrades are handled by server.on("upgrade") - skip them here
+        if (req.headers.upgrade === "websocket") {
+          return;
+        }
+
         // Check if dashboard dist directory exists
-        if (fs.existsSync(this.dashboardDistPath)) {
+        if (distExists) {
           this.serveStaticFile(req, res);
         } else {
           // Fallback if dashboard not built
