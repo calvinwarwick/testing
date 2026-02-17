@@ -54,37 +54,50 @@ class DashboardTransport extends Transport {
   }
 }
 
-// Ensure directories exist
-function ensureDir(dir: string): void {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+// Ensure directories exist (non-throwing so Railway/read-only fs doesn't crash startup)
+function ensureDir(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
-ensureDir(DATA_DIR);
-ensureDir(LOGS_DIR);
 
-// Daily rotating file transport - keeps logs forever
-const dailyRotateTransport = new (winston.transports as any).DailyRotateFile({
-  filename: `${LOGS_DIR}/bot-%DATE%.log`,
-  datePattern: "YYYY-MM-DD",
-  maxFiles: null, // Keep forever
-  maxSize: null, // No size limit
-});
+const logsDirOk = ensureDir(DATA_DIR) && ensureDir(LOGS_DIR);
+
+// Daily rotating file transport - only if logs dir is writable (skip on read-only fs e.g. some Railway setups)
+const dailyRotateTransport = logsDirOk
+  ? new (winston.transports as any).DailyRotateFile({
+      filename: `${LOGS_DIR}/bot-%DATE%.log`,
+      datePattern: "YYYY-MM-DD",
+      maxFiles: null,
+      maxSize: null,
+    })
+  : null;
+
+const fileTransports: Transport[] = [
+  new winston.transports.Console({
+    format: combine(colorize(), timestamp({ format: "HH:mm:ss.SSS" }), botFormat),
+  }),
+  new DashboardTransport(),
+];
+if (dailyRotateTransport) fileTransports.push(dailyRotateTransport);
+if (logsDirOk) {
+  fileTransports.push(
+    new winston.transports.File({
+      filename: `${LOGS_DIR}/bot-error.log`,
+      level: "error",
+    })
+  );
+}
 
 export const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || "info",
   format: combine(timestamp({ format: "YYYY-MM-DD HH:mm:ss.SSS" }), botFormat),
-  transports: [
-    new winston.transports.Console({
-      format: combine(colorize(), timestamp({ format: "HH:mm:ss.SSS" }), botFormat),
-    }),
-    dailyRotateTransport,
-    new winston.transports.File({
-      filename: `${LOGS_DIR}/bot-error.log`,
-      level: "error",
-    }),
-    new DashboardTransport(),
-  ],
+  transports: fileTransports,
 });
 
 // ============== TRADE RECORDING ==============

@@ -1,5 +1,5 @@
-import { loadConfig } from "./config";
-import { PolymarketArbBot } from "./bot";
+import type { BotConfig } from "./types";
+import type { PolymarketArbBot } from "./bot";
 import { logger, setDashboardLogBroadcast } from "./utils/logger";
 import { DashboardServer } from "./dashboard-server";
 import { loadSession, saveSession } from "./session-store";
@@ -36,14 +36,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // Now try to load config and start bot
-  // If this fails, dashboard will still be serving
-  let config: ReturnType<typeof loadConfig> | null = null;
+  // Load config and bot only after server is listening (defer heavy imports so crashes don't prevent dashboard from starting)
+  let config: BotConfig | null = null;
   let bot: PolymarketArbBot | null = null;
   let sessionFile: string | undefined = undefined;
   let periodicSave: ReturnType<typeof setInterval> | null = null;
 
   try {
+    const { loadConfig } = await import("./config");
     config = loadConfig();
     sessionFile = config.sessionFile ?? "data/session.json";
     const loadedSession = loadSession(sessionFile);
@@ -53,7 +53,8 @@ async function main(): Promise<void> {
       );
     }
 
-    bot = new PolymarketArbBot(config, dashboard, loadedSession);
+    const { PolymarketArbBot: BotClass } = await import("./bot");
+    bot = new BotClass(config, dashboard, loadedSession);
 
     // Handle graceful shutdown
     const shutdown = async (signal: string) => {
