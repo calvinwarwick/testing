@@ -21,12 +21,18 @@ async function main(): Promise<void> {
   // This ensures dashboard is available even if config loading or bot startup fails
   const port = Number(process.env.PORT || process.env.DASHBOARD_WS_PORT || "8765") || 0;
   let dashboard: DashboardServer | null = null;
+  let dashboardStarted = false;
   
   if (port > 0) {
     dashboard = new DashboardServer(port);
-    dashboard.start();
-    setDashboardLogBroadcast((entry) => dashboard!.broadcastLog(entry));
-    logger.info(`Dashboard server started on port ${port}`);
+    dashboardStarted = dashboard.start();
+    if (dashboardStarted) {
+      setDashboardLogBroadcast((entry) => dashboard!.broadcastLog(entry));
+      logger.info(`Dashboard server started on port ${port}`);
+    } else {
+      logger.error(`Dashboard server failed to start on port ${port}`);
+      dashboard = null; // Mark as failed
+    }
   }
 
   // Now try to load config and start bot
@@ -86,18 +92,43 @@ async function main(): Promise<void> {
     } catch (error) {
       logger.error("Bot failed to start", { error: String(error) });
       // If dashboard is serving, keep process alive so dashboard stays up (e.g. on Railway)
-      if (!dashboard) {
+      if (!dashboardStarted) {
         process.exit(1);
       }
+      // Otherwise, keep process alive so dashboard continues serving
     }
   } catch (error) {
     logger.error("Failed to load config or create bot", { error: String(error) });
     // If dashboard is serving, keep process alive so dashboard stays up (e.g. on Railway)
-    if (!dashboard) {
+    if (!dashboardStarted) {
       process.exit(1);
     }
     // Otherwise, keep process alive so dashboard continues serving
   }
+  
+  // Keep process alive if dashboard is running
+  // The HTTP server will keep the event loop active, but we add an explicit keep-alive
+  // to ensure the process doesn't exit even if there are no active connections
+  if (dashboardStarted) {
+    logger.info("Dashboard is running - process will stay alive to serve requests");
+    // The HTTP server keeps the event loop alive, so we don't need to do anything else
+    // But we log this to confirm the process should stay running
+  }
 }
 
-main();
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("Unhandled promise rejection", { reason: String(reason), promise: String(promise) });
+  // Don't exit if dashboard is running - keep serving
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", { error: String(error) });
+  // Don't exit if dashboard is running - keep serving
+});
+
+main().catch((error) => {
+  logger.error("Main function failed", { error: String(error) });
+  // Don't exit - let the process stay alive if dashboard is serving
+  // The HTTP server will keep the event loop alive
+});

@@ -178,8 +178,11 @@ export class DashboardServer {
     }
   }
 
-  start(): void {
-    if (this.port <= 0) return;
+  start(): boolean {
+    if (this.port <= 0) {
+      console.warn(`Dashboard server not started: invalid port ${this.port}`);
+      return false;
+    }
     try {
       // Verify dashboard dist path exists
       const distExists = fs.existsSync(this.dashboardDistPath);
@@ -220,18 +223,37 @@ export class DashboardServer {
           this.wss!.emit("connection", ws, req);
         });
       });
+      
       // Bind to 0.0.0.0 so Railway (and other cloud proxies) can reach the server
       server.listen(this.port, "0.0.0.0", () => {
         console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
       });
+      
       this.httpServer = server;
       this.httpServer.on("error", (err) => {
-        console.warn(`Dashboard server error: ${err}`);
-        this.stop();
+        console.error(`Dashboard server error: ${err}`);
+        // Only stop if server was actually listening
+        if (this.httpServer && this.httpServer.listening) {
+          this.stop();
+        }
       });
+      
+      // Give server a moment to start, then verify it's listening
+      setTimeout(() => {
+        if (this.httpServer && this.httpServer.listening) {
+          console.log(`Dashboard server confirmed listening on port ${this.port}`);
+        } else {
+          console.error(`Dashboard server failed to start listening on port ${this.port}`);
+        }
+      }, 100);
+      
+      // Return true if server was created successfully
+      // Note: server.listen() is synchronous and will throw if there's an immediate error
+      // The actual listening happens asynchronously, verified by the setTimeout above
+      return true;
     } catch (err) {
-      console.warn(`Dashboard server failed to start on port ${this.port}: ${err}`);
-      return;
+      console.error(`Dashboard server failed to start on port ${this.port}: ${err}`);
+      return false;
     }
   }
 
