@@ -1,4 +1,4 @@
-/** Core types for the Polymarket arbitrage bot */
+/** Core types for the Polymarket directional (5-min BTC up/down) bot */
 
 export interface BotConfig {
   /** Polymarket CLOB API base URL */
@@ -13,8 +13,6 @@ export interface BotConfig {
   binanceApiKey: string;
   /** Binance API secret */
   binanceApiSecret: string;
-  /** Minimum profit in cents to trigger a trade */
-  minProfitThresholdCents: number;
   /** Maximum position size in USDC per trade */
   maxPositionSizeUsdc: number;
   /** How often to poll for prices (ms) */
@@ -29,15 +27,11 @@ export interface BotConfig {
   maxOpenPositions?: number;
   /** Path to session persistence file (e.g. data/session.json) */
   sessionFile?: string;
-  /** Max profit % before treating as suspicious data error (default 50) */
-  maxProfitPercentBeforeSuspicious?: number;
   /** Min ms between trades (default 2000) */
   minTimeBetweenTradesMs?: number;
-  /** Max trades per minute (default 20). Rate limit to prevent runaway trading. */
+  /** Max trades per minute (default 50). Rate limit to prevent runaway trading. */
   maxTradesPerMinute?: number;
-  /** If true, only take pure arbitrage (yes+no < $1); skip directional opportunities */
-  pureArbOnly?: boolean;
-  /** If true, only take directional trades (exchange vs Polymarket); skip pure arbitrage */
+  /** If true, only take directional trades (exchange vs Polymarket). */
   directionalOnly?: boolean;
   /** Min edge % for directional opportunities (default 10). Only enter when edge is clearly there. */
   minEdgePercent?: number;
@@ -57,13 +51,15 @@ export interface BotConfig {
   chainlinkDsApiSecret?: string;
   /** Optional: Chainlink Data Streams BTC/USD feed ID (hex). If unset and Chainlink is configured, resolved via listFeeds() or default constant. */
   chainlinkBtcUsdFeedId?: string;
+  /** Fractional Kelly multiplier for position sizing (default 0.25 = quarter-Kelly). Range [0.05, 1.0]. */
+  kellyMultiplier?: number;
 }
 
 /** Persisted session state for cross-restart tracking. */
 export interface PersistedSession {
   totalProfit: number;
   totalTradesExecuted: number;
-  /** Trades with known positive profit (pure arb: actualProfit > 0; directional: when settlement tracked) */
+  /** Trades with known positive profit (when settlement tracked) */
   profitableTrades?: number;
   firstRunAt?: number;
   dailyPnL: number;
@@ -151,6 +147,10 @@ export interface ArbitrageOpportunity {
   windowStartBtcPrice?: number;
   /** Time detected */
   detectedAt: number;
+  /** Kelly Criterion optimal fraction of bankroll (0..1) */
+  kellyFraction?: number;
+  /** Estimated win probability used for Kelly calculation */
+  estimatedWinProbability?: number;
 }
 
 /** Result of an executed trade */
@@ -180,6 +180,8 @@ export interface ArbitrageExecution {
   settled?: boolean;
   /** Set when a directional loss was capped by stop-loss (dashboard can show "capped") */
   lossCapped?: boolean;
+  /** Set when a position was exited early to lock in profit (trailing take-profit) */
+  profitTaken?: boolean;
 }
 
 /** Order book level */
@@ -221,4 +223,10 @@ export interface TradeRecord {
   btcPriceAtSettlement?: number;
   /** True if position was closed by stop-loss (not held to resolution) */
   lossCapped?: boolean;
+  /** True if position was exited early by trailing take-profit */
+  profitTaken?: boolean;
+  /** Kelly Criterion fraction used for sizing this trade */
+  kellyFraction?: number;
+  /** Estimated win probability at entry */
+  estimatedWinProbability?: number;
 }

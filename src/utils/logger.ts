@@ -90,13 +90,15 @@ export const logger = winston.createLogger({
 // ============== TRADE RECORDING ==============
 const TRADES_FILE = `${DATA_DIR}/trades.json`;
 let tradeRecords: TradeRecord[] = [];
+let tradeWriteInProgress = false;
+let tradeWritePending = false;
 
 export function loadTradeRecords(): TradeRecord[] {
   try {
     if (fs.existsSync(TRADES_FILE)) {
       const data = fs.readFileSync(TRADES_FILE, "utf-8");
       tradeRecords = JSON.parse(data);
-      logger.info(`Loaded ${tradeRecords.length} trade records from disk`);
+      logger.debug(`Loaded ${tradeRecords.length} trade records from disk`);
     }
   } catch (err) {
     logger.warn(`Failed to load trade records: ${err}`);
@@ -106,24 +108,34 @@ export function loadTradeRecords(): TradeRecord[] {
 }
 
 function saveTradeRecords(): void {
-  try {
-    fs.writeFileSync(TRADES_FILE, JSON.stringify(tradeRecords, null, 2), "utf-8");
-  } catch (err) {
-    logger.error(`Failed to save trade records: ${err}`);
+  if (tradeWriteInProgress) {
+    tradeWritePending = true;
+    return;
   }
+  tradeWriteInProgress = true;
+  fs.promises.writeFile(TRADES_FILE, JSON.stringify(tradeRecords, null, 2), "utf-8")
+    .catch((err) => logger.error(`Failed to save trade records: ${err}`))
+    .finally(() => {
+      tradeWriteInProgress = false;
+      if (tradeWritePending) {
+        tradeWritePending = false;
+        saveTradeRecords();
+      }
+    });
 }
 
 export function recordTrade(trade: TradeRecord): void {
   tradeRecords.push(trade);
   saveTradeRecords();
-  logger.info(`Trade recorded: ${trade.id} ${trade.side} ${trade.type} $${trade.cost.toFixed(2)}`);
+  logger.debug(`Trade recorded: ${trade.id} ${trade.side} $${trade.cost.toFixed(2)}`);
 }
 
 export function updateTradeSettlement(
   id: string,
   profit: number,
   btcPriceAtSettlement: number,
-  lossCapped?: boolean
+  lossCapped?: boolean,
+  profitTaken?: boolean
 ): boolean {
   const trade = tradeRecords.find((t) => t.id === id);
   if (!trade) return false;
@@ -134,8 +146,9 @@ export function updateTradeSettlement(
   trade.outcome = profit > 0 ? "win" : "loss";
   trade.btcPriceAtSettlement = btcPriceAtSettlement;
   if (lossCapped != null) trade.lossCapped = lossCapped;
+  if (profitTaken != null) trade.profitTaken = profitTaken;
   saveTradeRecords();
-  const statusLabel = lossCapped ? "stopped" : trade.outcome;
+  const statusLabel = profitTaken ? "take-profit" : lossCapped ? "stopped" : trade.outcome;
   logger.info(`Trade settled: ${id} ${statusLabel} $${profit.toFixed(2)}`);
   return true;
 }
@@ -189,13 +202,15 @@ export interface HistoricalMarket {
 
 const MARKETS_FILE = `${DATA_DIR}/historical-markets.json`;
 let historicalMarkets: HistoricalMarket[] = [];
+let marketsWriteInProgress = false;
+let marketsWritePending = false;
 
 export function loadHistoricalMarkets(): HistoricalMarket[] {
   try {
     if (fs.existsSync(MARKETS_FILE)) {
       const data = fs.readFileSync(MARKETS_FILE, "utf-8");
       historicalMarkets = JSON.parse(data);
-      logger.info(`Loaded ${historicalMarkets.length} historical market records`);
+      logger.debug(`Loaded ${historicalMarkets.length} historical market records`);
     }
   } catch (err) {
     logger.warn(`Failed to load historical markets: ${err}`);
@@ -205,11 +220,20 @@ export function loadHistoricalMarkets(): HistoricalMarket[] {
 }
 
 function saveHistoricalMarkets(): void {
-  try {
-    fs.writeFileSync(MARKETS_FILE, JSON.stringify(historicalMarkets, null, 2), "utf-8");
-  } catch (err) {
-    logger.error(`Failed to save historical markets: ${err}`);
+  if (marketsWriteInProgress) {
+    marketsWritePending = true;
+    return;
   }
+  marketsWriteInProgress = true;
+  fs.promises.writeFile(MARKETS_FILE, JSON.stringify(historicalMarkets, null, 2), "utf-8")
+    .catch((err) => logger.error(`Failed to save historical markets: ${err}`))
+    .finally(() => {
+      marketsWriteInProgress = false;
+      if (marketsWritePending) {
+        marketsWritePending = false;
+        saveHistoricalMarkets();
+      }
+    });
 }
 
 export function recordHistoricalMarket(market: HistoricalMarket): void {
@@ -220,12 +244,25 @@ export function recordHistoricalMarket(market: HistoricalMarket): void {
   // Insert at the top so the most recently closed window is first in the list
   historicalMarkets.unshift(market);
   saveHistoricalMarkets();
-  logger.info(`Historical market recorded: ${new Date(market.windowEnd * 1000).toISOString()} outcome=${market.outcome}`);
+  logger.debug(`Historical market recorded: ${new Date(market.windowEnd * 1000).toISOString()} outcome=${market.outcome}`);
 }
 
 export function getHistoricalMarkets(limit?: number): HistoricalMarket[] {
   const sorted = [...historicalMarkets].sort((a, b) => b.windowEnd - a.windowEnd);
   return limit ? sorted.slice(0, limit) : sorted;
+}
+
+/**
+ * Update outcome for an existing historical market by windowEnd (e.g. when Polymarket API disagrees).
+ * Persists so historical-markets.json converges to Polymarket resolution.
+ */
+export function updateHistoricalMarketOutcome(windowEnd: number, outcome: "UP" | "DOWN"): boolean {
+  const idx = historicalMarkets.findIndex((m) => m.windowEnd === windowEnd);
+  if (idx === -1) return false;
+  historicalMarkets[idx] = { ...historicalMarkets[idx], outcome };
+  saveHistoricalMarkets();
+  logger.info(`Historical market outcome updated: ${new Date(windowEnd * 1000).toISOString()} outcome=${outcome}`);
+  return true;
 }
 
 // ============== PERSISTENT LOG RECORDING ==============
@@ -239,13 +276,15 @@ export interface PersistentLogEntry {
 const LOGS_JSON_FILE = `${DATA_DIR}/logs.json`;
 let persistentLogs: PersistentLogEntry[] = [];
 let logsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let logsWriteInProgress = false;
+let logsWritePending = false;
 
 export function loadPersistentLogs(): PersistentLogEntry[] {
   try {
     if (fs.existsSync(LOGS_JSON_FILE)) {
       const data = fs.readFileSync(LOGS_JSON_FILE, "utf-8");
       persistentLogs = JSON.parse(data);
-      logger.info(`Loaded ${persistentLogs.length} persistent log entries`);
+      logger.debug(`Loaded ${persistentLogs.length} persistent log entries`);
     }
   } catch (err) {
     logger.warn(`Failed to load persistent logs: ${err}`);
@@ -255,12 +294,22 @@ export function loadPersistentLogs(): PersistentLogEntry[] {
 }
 
 function savePersistentLogs(): void {
-  try {
-    fs.writeFileSync(LOGS_JSON_FILE, JSON.stringify(persistentLogs, null, 2), "utf-8");
-  } catch (err) {
-    // Don't use logger here to avoid infinite loop
-    console.error(`Failed to save persistent logs: ${err}`);
+  if (logsWriteInProgress) {
+    logsWritePending = true;
+    return;
   }
+  logsWriteInProgress = true;
+  fs.promises.writeFile(LOGS_JSON_FILE, JSON.stringify(persistentLogs, null, 2), "utf-8")
+    .catch((err) => {
+      console.error(`Failed to save persistent logs: ${err}`);
+    })
+    .finally(() => {
+      logsWriteInProgress = false;
+      if (logsWritePending) {
+        logsWritePending = false;
+        savePersistentLogs();
+      }
+    });
 }
 
 // Debounced save to avoid too many disk writes
@@ -272,8 +321,13 @@ function scheduleSaveLogs(): void {
   }, 5000); // Save every 5 seconds max
 }
 
+const MAX_PERSISTENT_LOGS = 10_000;
+
 export function addPersistentLog(entry: PersistentLogEntry): void {
   persistentLogs.push(entry);
+  if (persistentLogs.length > MAX_PERSISTENT_LOGS) {
+    persistentLogs = persistentLogs.slice(-MAX_PERSISTENT_LOGS);
+  }
   scheduleSaveLogs();
 }
 

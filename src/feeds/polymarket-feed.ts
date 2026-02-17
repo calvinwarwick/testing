@@ -162,7 +162,7 @@ export class PolymarketFeed {
     }
 
     if (markets.length > 0) {
-      logger.info(`SIMULATION MODE: Generated ${markets.length} simulated BTC 5-min markets`);
+      logger.debug(`SIMULATION: ${markets.length} simulated BTC 5-min markets`);
     }
     return markets;
   }
@@ -303,6 +303,65 @@ export class PolymarketFeed {
   }
 
   /**
+   * Fetch Polymarket event page and parse official "price to beat" (openPrice) from __NEXT_DATA__.
+   * Matches what Polymarket shows on the UI. Use when Chainlink is not configured.
+   */
+  async getPriceToBeatForEventPage(slug: string): Promise<number | null> {
+    const url = `https://polymarket.com/event/${encodeURIComponent(slug)}`;
+    try {
+      const res = await axios.get<string>(url, {
+        timeout: 12000,
+        responseType: "text",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+      });
+      const html = res.data;
+      const scriptMatch = html.match(
+        /<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i
+      );
+      if (!scriptMatch) return null;
+      const nextData = JSON.parse(scriptMatch[1]) as {
+        props?: {
+          pageProps?: {
+            dehydratedState?: {
+              queries?: Array<{ queryKey?: unknown[]; state?: { data?: unknown } }>;
+            };
+          };
+        };
+      };
+      const queries =
+        nextData.props?.pageProps?.dehydratedState?.queries ?? [];
+      for (const q of queries) {
+        const key = q.queryKey as unknown[] | undefined;
+        const data = q.state?.data;
+        if (!key || !Array.isArray(key)) continue;
+        if (
+          key[0] === "crypto-prices" &&
+          key[1] === "price" &&
+          key[2] === "BTC" &&
+          key.length >= 6
+        ) {
+          const d = data as { openPrice?: number } | undefined;
+          if (typeof d?.openPrice === "number" && Number.isFinite(d.openPrice)) {
+            return d.openPrice;
+          }
+        }
+      }
+      return null;
+    } catch (e) {
+      logger.debug("Polymarket price-to-beat fetch failed", {
+        slug,
+        error: String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Fetch BTC 5-min markets by requesting event slugs for the current and next windows.
    * Slug pattern: btc-updown-5m-{unix_timestamp} (window end time, 5-min = 300s apart).
    * We use current time so we always request windows that exist (not a fixed env slug).
@@ -358,11 +417,7 @@ export class PolymarketFeed {
       }
 
       const markets = this.eventsToMarkets(events);
-      if (markets.length > 0) {
-        logger.info(
-          `Found ${markets.length} active BTC 5-min markets (slugs: ${slugs[0]}..${slugs[slugs.length - 1]})`
-        );
-      } else if (events.length > 0) {
+      if (markets.length === 0 && events.length > 0) {
         logger.warn(
           `Gamma returned ${events.length} events but none passed filters (enableOrderBook, clobTokenIds, endTime)`
         );
@@ -512,7 +567,7 @@ export class PolymarketFeed {
         });
       }
 
-      logger.info(`Found ${markets.length} active ${asset} 5-min markets`);
+      logger.debug(`Found ${markets.length} active ${asset} 5-min markets`);
       return markets;
     } catch (error) {
       logger.error("Failed to fetch markets from Gamma API", {
@@ -663,7 +718,7 @@ export class PolymarketFeed {
 
   /**
    * Get the current best prices for a market (both YES and NO sides).
-   * This is the core data we need for arbitrage detection.
+   * This is the core data we need for directional detection.
    * In simulation mode, generates realistic prices that lag behind BTC.
    */
   async getMarketPrices(market: PolymarketMarket, currentBtcPrice?: number, windowStartBtcPrice?: number): Promise<MarketPrices | null> {
@@ -716,25 +771,25 @@ export class PolymarketFeed {
 
       // Best ask = lowest price someone is willing to sell at (cost to buy)
       // Best bid = highest price someone is willing to buy at (what we can sell for)
-      const yesBestAskLevel = yesBook.asks.length > 0
-        ? yesBook.asks.reduce((min, a) => (a.price < min.price ? a : min))
-        : null;
-      const yesBestAsk = yesBook.asks.length > 0
-        ? Math.min(...yesBook.asks.map((a) => a.price))
-        : 1.0;
-      const yesBestAskSize = yesBestAskLevel?.size;
+      // Single-pass reduce: find best price + size in one iteration per array
+      const yesBestAskResult = yesBook.asks.reduce<{ price: number; size: number }>(
+        (best, a) => (a.price < best.price ? a : best),
+        { price: Infinity, size: 0 }
+      );
+      const yesBestAsk = yesBook.asks.length > 0 ? yesBestAskResult.price : 1.0;
+      const yesBestAskSize = yesBook.asks.length > 0 ? yesBestAskResult.size : undefined;
       const yesBestBid = yesBook.bids.length > 0
-        ? Math.max(...yesBook.bids.map((b) => b.price))
+        ? yesBook.bids.reduce((max, b) => (b.price > max ? b.price : max), -Infinity)
         : 0.0;
-      const noBestAskLevel = noBook.asks.length > 0
-        ? noBook.asks.reduce((min, a) => (a.price < min.price ? a : min))
-        : null;
-      const noBestAsk = noBook.asks.length > 0
-        ? Math.min(...noBook.asks.map((a) => a.price))
-        : 1.0;
-      const noBestAskSize = noBestAskLevel?.size;
+
+      const noBestAskResult = noBook.asks.reduce<{ price: number; size: number }>(
+        (best, a) => (a.price < best.price ? a : best),
+        { price: Infinity, size: 0 }
+      );
+      const noBestAsk = noBook.asks.length > 0 ? noBestAskResult.price : 1.0;
+      const noBestAskSize = noBook.asks.length > 0 ? noBestAskResult.size : undefined;
       const noBestBid = noBook.bids.length > 0
-        ? Math.max(...noBook.bids.map((b) => b.price))
+        ? noBook.bids.reduce((max, b) => (b.price > max ? b.price : max), -Infinity)
         : 0.0;
 
       return {
@@ -759,7 +814,7 @@ export class PolymarketFeed {
 
   /**
    * Generate simulated market prices that lag behind BTC movements.
-   * Creates realistic arbitrage opportunities when BTC moves quickly.
+   * Creates realistic directional opportunities when BTC moves quickly.
    */
   private getSimulatedMarketPrices(market: PolymarketMarket, currentBtcPrice?: number, windowStartBtcPrice?: number): MarketPrices | null {
     const now = Date.now();
@@ -779,7 +834,7 @@ export class PolymarketFeed {
       const fairYesPrice = Math.min(0.85, Math.max(0.15, 0.5 + btcMovePercent * 0.4));
 
       // Simulated market is SLOW - only reacts to 30% of the fair move
-      // This creates the arbitrage opportunity we're looking for
+      // This creates the directional opportunity we're looking for
       const lagFactor = 0.30;
       const targetYes = 0.5 + (fairYesPrice - 0.5) * lagFactor;
       const targetNo = 1.0 - targetYes;

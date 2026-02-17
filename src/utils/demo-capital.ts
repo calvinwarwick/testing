@@ -44,8 +44,12 @@ export function decideDemoCapitalSizing(input: {
   totalCostPerShareUsd: number;
   suggestedSize: number;
   maxPerTradeFraction?: number;
+  /** Raw Kelly fraction from detector (0..1). When provided with kellyMultiplier, replaces flat maxPerTradeFraction. */
+  kellyFraction?: number;
+  /** Fractional Kelly multiplier (e.g. 0.25 = quarter-Kelly). Default 0.25. */
+  kellyMultiplier?: number;
 }): DemoCapitalDecision {
-  const maxPerTradeFraction = input.maxPerTradeFraction ?? 0.05;
+  const hardCapFraction = input.maxPerTradeFraction ?? 0.15;
   const currentBalanceUsd = Math.max(
     0,
     input.startingBalanceUsd + input.lifetimeProfitUsd
@@ -68,8 +72,15 @@ export function decideDemoCapitalSizing(input: {
     };
   }
 
+  // Kelly-based sizing: use fractional Kelly when available, otherwise fall back to hard cap
+  const kellyMultiplier = input.kellyMultiplier ?? 0.25;
+  const effectiveFraction =
+    input.kellyFraction != null && input.kellyFraction > 0
+      ? Math.min(input.kellyFraction * kellyMultiplier, hardCapFraction)
+      : hardCapFraction;
+
   const maxAllowedNotionalUsd = Math.min(
-    currentBalanceUsd * maxPerTradeFraction,
+    currentBalanceUsd * effectiveFraction,
     availableBalanceUsd
   );
   const finalSuggestedSize = Math.max(
