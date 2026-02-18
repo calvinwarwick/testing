@@ -21,6 +21,7 @@ import {
   getPersistentLogs,
   getHistoricalMarkets,
   updateHistoricalMarketOutcome,
+  getTradeStats,
 } from "./utils/logger";
 import {
   getCurrentFiveMinWindow,
@@ -36,6 +37,7 @@ import {
   ArbitrageOpportunity,
   ArbitrageExecution,
   PersistedSession,
+  ExchangePrice,
 } from "./types";
 import type { DashboardServer, DashboardState } from "./dashboard-server";
 
@@ -69,6 +71,7 @@ export class PolymarketArbBot {
 
   private isRunning = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private progressLogTimer: ReturnType<typeof setInterval> | null = null;
   private activeMarkets: PolymarketMarket[] = [];
   private executions: ArbitrageExecution[] = [];
   private releasedPositionKeys = new Set<string>();
@@ -104,7 +107,7 @@ export class PolymarketArbBot {
   private lastPriceToBeatFetchBySlug = new Map<string, number>();
   /** Change detection key for dashboard broadcast (skip when unchanged) */
   private _lastBroadcastKey = "";
-  private static readonly PRICE_TO_BEAT_FETCH_INTERVAL_MS = 10_000;
+  private static readonly PRICE_TO_BEAT_FETCH_INTERVAL_MS = 5_000; // Reduced from 10s to 5s for faster retries
   private recentResolvedMarkets: NonNullable<DashboardState["historicalMarkets"]> =
     [];
   private stats = {
@@ -201,6 +204,10 @@ export class PolymarketArbBot {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    if (this.progressLogTimer) {
+      clearInterval(this.progressLogTimer);
+      this.progressLogTimer = null;
+    }
 
     this.exchangeFeed.stop();
 
@@ -228,6 +235,7 @@ export class PolymarketArbBot {
       (t) => t.settled && typeof t.profit === "number"
     );
     this.lifetimeTotalProfit = settled.reduce((sum, t) => sum + (t.profit ?? 0), 0);
+    // Count only profitable trades (profit > 0) as wins
     this.lifetimeProfitableTrades = settled.filter((t) => (t.profit ?? 0) > 0).length;
     this._profitSyncDirty = false;
   }
@@ -374,6 +382,49 @@ export class PolymarketArbBot {
         await this.discoverMarkets();
       }
     }, discoverIntervalMs);
+
+    // Periodic progress log (balance, uptime, trades, win ratio, profit)
+    const progressLogIntervalMs = 600_000; // 10 minutes
+    this.progressLogTimer = setInterval(() => {
+      if (this.isRunning) {
+        this.logProgressStatus();
+      }
+    }, progressLogIntervalMs);
+  }
+
+  /**
+   * Log a one-line progress summary: uptime, balance (demo), trades, win ratio, profit.
+   */
+  private logProgressStatus(): void {
+    this.syncLifetimeProfitFromTradeLog();
+    const uptimeMs = Date.now() - this.stats.startTime;
+    const uptimeSec = Math.floor(uptimeMs / 1000);
+    const uptimeMin = Math.floor(uptimeSec / 60);
+    const uptimeHr = Math.floor(uptimeMin / 60);
+    const uptimeStr =
+      uptimeHr > 0
+        ? `${uptimeHr}h ${uptimeMin % 60}m`
+        : `${uptimeMin}m`;
+
+    const trades = this.lifetimeTradesExecuted;
+    const wins = this.lifetimeProfitableTrades;
+    // Win rate = wins / (wins + losses) - only count profitable vs losing trades
+    const stats = getTradeStats();
+    const totalWinLossTrades = stats.wins + stats.losses;
+    const winRateStr =
+      totalWinLossTrades > 0 ? `${((wins / totalWinLossTrades) * 100).toFixed(0)}%` : "—";
+    const profit = this.lifetimeTotalProfit;
+    const profitStr = profit >= 0 ? `+$${profit.toFixed(2)}` : `$${profit.toFixed(2)}`;
+
+    let balancePart = "";
+    if (this.config.dryRun && (this.config.demoStartingBalance ?? 0) > 0) {
+      const balance = (this.config.demoStartingBalance ?? 1000) + profit;
+      balancePart = ` | balance $${balance.toFixed(2)}`;
+    }
+
+    logger.info(
+      `[Progress] uptime ${uptimeStr} | trades ${trades} | win rate ${winRateStr} | PnL ${profitStr}${balancePart}`
+    );
   }
 
   /**
@@ -396,30 +447,27 @@ export class PolymarketArbBot {
       logger.warn("No active BTC 5-min markets found on Polymarket");
     }
 
-    // Capture BTC price at each market's start time: prefer Chainlink at exact timestamp, then Polymarket page "price to beat"
+    // Window start price: only from Chainlink (when configured) or Polymarket scraping — never from exchange/previous-window
     const exchangePrice = this.exchangeFeed.getLatestPrice();
     const cexPrices = this.exchangeFeed.getPricesByExchange();
     for (const market of this.activeMarkets) {
-      if (!this.windowStartPrices.has(market.startTime)) {
-        if (isChainlinkConfigured()) {
-          // Primary: Chainlink at exact window start timestamp
-          const chainlinkPrice = await getBtcPriceAtTimestamp(market.startTime);
-          if (chainlinkPrice != null) {
-            this.windowStartPrices.set(market.startTime, chainlinkPrice);
-            // Capture per-exchange prices at window start (even when using Chainlink for aggregated)
-            const exchangeStartPrices: Record<string, number> = {};
-            cexPrices.forEach((price, name) => {
-              exchangeStartPrices[name] = price;
-            });
-            this.windowStartPricesByExchange.set(market.startTime, exchangeStartPrices);
-            logger.info(`New window starting price added: $${chainlinkPrice.toFixed(2)} for ${market.slug} (from Chainlink)`);
-            logger.debug(`Chainlink window start price: $${chainlinkPrice.toFixed(2)} for ${market.slug}`);
-          }
+      if (this.windowStartPrices.has(market.startTime)) continue;
+      if (isChainlinkConfigured()) {
+        const chainlinkPrice = await getBtcPriceAtTimestamp(market.startTime);
+        if (chainlinkPrice != null) {
+          this.windowStartPrices.set(market.startTime, chainlinkPrice);
+          const exchangeStartPrices: Record<string, number> = {};
+          cexPrices.forEach((price, name) => {
+            exchangeStartPrices[name] = price;
+          });
+          this.windowStartPricesByExchange.set(market.startTime, exchangeStartPrices);
+          logger.info(`New window starting price added: $${chainlinkPrice.toFixed(2)} for ${market.slug} (from Chainlink)`);
+          logger.debug(`Chainlink window start price: $${chainlinkPrice.toFixed(2)} for ${market.slug}`);
         }
       }
     }
-    // Fallback: Polymarket event page "price to beat" (throttled) for any markets still missing a start price
-    {
+    // When Chainlink is not configured, use only Polymarket event page "price to beat" (throttled)
+    if (!isChainlinkConfigured()) {
       const nowMs = Date.now();
       for (const market of this.activeMarkets) {
         if (this.windowStartPrices.has(market.startTime)) continue;
@@ -434,24 +482,22 @@ export class PolymarketArbBot {
             logger.debug(`Polymarket price to beat: $${priceToBeat.toFixed(2)} for ${market.slug}`);
           }
         } catch {
-          // ignore; will fall back to exchange below if still missing
+          // ignore; will retry on next discover
         }
       }
     }
-    if (exchangePrice) {
-      // Set the global reference for the current window ONLY IF we captured it at window start
-      // This prevents the reference from "chasing" the current price
-      const { startTime } = getCurrentFiveMinWindow();
-      const capturedStartPrice = this.windowStartPrices.get(startTime);
-      if (capturedStartPrice !== undefined) {
-        this.detector.setWindowReference(capturedStartPrice, startTime);
-      } else {
-        logger.debug(
-          `Window reference unavailable for ${new Date(
-            startTime * 1000
-          ).toISOString()} (not captured near boundary yet)`
-        );
-      }
+    // Set the global reference for the current window if we have the start price
+    // This enables immediate opportunity detection as soon as price is captured
+    const { startTime } = getCurrentFiveMinWindow();
+    const capturedStartPrice = this.windowStartPrices.get(startTime);
+    if (capturedStartPrice !== undefined) {
+      this.detector.setWindowReference(capturedStartPrice, startTime);
+    } else if (exchangePrice) {
+      logger.debug(
+        `Window reference unavailable for ${new Date(
+          startTime * 1000
+        ).toISOString()} (not captured near boundary yet)`
+      );
     }
 
     // Clean up old window start prices (older than 10 minutes)
@@ -482,20 +528,14 @@ export class PolymarketArbBot {
   private async cycle(): Promise<void> {
     this.stats.cyclesRun++;
 
-    // Check if we've crossed into a new window and capture prices at exact boundary
+    // Track window boundary (window start price is set only via Chainlink or Polymarket scraping, never from exchange)
     const { startTime: currentWindowStart } = getCurrentFiveMinWindow();
     if (currentWindowStart !== this.lastSeenWindowStart && currentWindowStart > this.lastSeenWindowStart) {
-      // New window detected - capture exchange price as the END price for the previous window
-      const exchangePrice = this.exchangeFeed.getLatestPrice();
-      if (exchangePrice && this.lastSeenWindowStart > 0) {
-        const previousWindowEnd = this.lastSeenWindowStart + 300; // Previous window's end time
-        if (!this.windowEndPrices.has(previousWindowEnd)) {
-          this.windowEndPrices.set(previousWindowEnd, exchangePrice.price);
-          logger.debug(`Captured window end price: $${exchangePrice.price.toFixed(2)} for window ending at ${previousWindowEnd}`);
-        }
-      }
+      logger.debug(`New window detected: ${currentWindowStart} (previous: ${this.lastSeenWindowStart})`);
       
-      // Capture per-exchange prices immediately at window start timestamp
+      // Immediately discover markets and fetch window start price for new window
+      await this.discoverMarkets();
+      
       const cexPrices = this.exchangeFeed.getPricesByExchange();
       if (cexPrices.size > 0 && !this.windowStartPricesByExchange.has(currentWindowStart)) {
         const exchangeStartPrices: Record<string, number> = {};
@@ -504,6 +544,37 @@ export class PolymarketArbBot {
         });
         this.windowStartPricesByExchange.set(currentWindowStart, exchangeStartPrices);
         logger.debug(`Captured CEX window start prices for window ${currentWindowStart}`);
+      }
+      
+      // Immediately try to fetch window start price (bypass throttle for new windows)
+      const newWindowMarket = this.activeMarkets.find(m => m.startTime === currentWindowStart);
+      if (newWindowMarket && !this.windowStartPrices.has(currentWindowStart)) {
+        if (isChainlinkConfigured()) {
+          const chainlinkPrice = await getBtcPriceAtTimestamp(currentWindowStart);
+          if (chainlinkPrice != null) {
+            this.windowStartPrices.set(currentWindowStart, chainlinkPrice);
+            const exchangeStartPrices: Record<string, number> = {};
+            cexPrices.forEach((price, name) => {
+              exchangeStartPrices[name] = price;
+            });
+            this.windowStartPricesByExchange.set(currentWindowStart, exchangeStartPrices);
+            logger.info(`New window starting price added: $${chainlinkPrice.toFixed(2)} for ${newWindowMarket.slug} (from Chainlink)`);
+            this.detector.setWindowReference(chainlinkPrice, currentWindowStart);
+          }
+        } else {
+          // Immediately fetch price-to-beat for new window (bypass throttle)
+          try {
+            const priceToBeat = await this.polymarketFeed.getPriceToBeatForEventPage(newWindowMarket.slug);
+            if (priceToBeat != null && Number.isFinite(priceToBeat)) {
+              this.windowStartPrices.set(currentWindowStart, priceToBeat);
+              this.lastPriceToBeatFetchBySlug.set(newWindowMarket.slug, Date.now());
+              logger.info(`New window starting price added: $${priceToBeat.toFixed(2)} for ${newWindowMarket.slug} (from Polymarket price to beat)`);
+              this.detector.setWindowReference(priceToBeat, currentWindowStart);
+            }
+          } catch (error) {
+            logger.debug(`Failed to fetch price-to-beat for new window ${newWindowMarket.slug}: ${error}`);
+          }
+        }
       }
       
       this.lastSeenWindowStart = currentWindowStart;
@@ -546,7 +617,7 @@ export class PolymarketArbBot {
         }
       }
     }
-    // When Chainlink is not configured, try Polymarket price-to-beat (throttled)
+    // When Chainlink is not configured, try Polymarket price-to-beat (throttled, but already fetched for new windows above)
     if (!isChainlinkConfigured()) {
       const nowMs = Date.now();
       for (const market of this.activeMarkets) {
@@ -560,6 +631,11 @@ export class PolymarketArbBot {
             this.windowStartPrices.set(market.startTime, priceToBeat);
             logger.info(`New window starting price added: $${priceToBeat.toFixed(2)} for ${market.slug} (from Polymarket price to beat)`);
             logger.debug(`Polymarket price to beat: $${priceToBeat.toFixed(2)} for ${market.slug}`);
+            // Set window reference if this is the current window
+            const { startTime } = getCurrentFiveMinWindow();
+            if (market.startTime === startTime) {
+              this.detector.setWindowReference(priceToBeat, startTime);
+            }
           }
         } catch {
           // ignore
@@ -632,6 +708,9 @@ export class PolymarketArbBot {
       }
     }
 
+    // Check open positions for stop loss and take profit exits
+    await this.checkStopLossAndTakeProfit(exchangePrice);
+
     await this.releasePositionsForEndedMarkets(exchangePrice?.price ?? null);
     
     // Clean up old pending settlements (older than 1 hour) - they should have resolved by then
@@ -653,6 +732,94 @@ export class PolymarketArbBot {
     
     this.trimExecutions();
     await this.broadcastDashboardState(exchangePrice);
+  }
+
+  /**
+   * Check open positions for stop loss and take profit conditions, exit if triggered.
+   */
+  private async checkStopLossAndTakeProfit(exchangePrice: ExchangePrice | null): Promise<void> {
+    if (!exchangePrice) return;
+    
+    const stopLossPercent = this.config.stopLossPercent ?? 0.10;
+    
+    // Skip if disabled
+    if (stopLossPercent === 0) return;
+    
+    const nowSec = Math.floor(Date.now() / 1000);
+    
+    for (const execution of this.executions) {
+      if (!execution.fullyExecuted || execution.settled || execution.pendingSettlement) continue;
+      if (execution.opportunity.market.endTime <= nowSec) continue; // Window ended, will be settled
+      
+      const key = this.getExecutionKey(execution);
+      const opp = execution.opportunity;
+      const isUp = opp.exchangeSignal === "UP";
+      const side = isUp ? "YES" : "NO";
+      const tokenId = isUp ? opp.market.yesTokenId : opp.market.noTokenId;
+      const entryPrice = isUp ? opp.yesPrice : opp.noPrice;
+      const filledSize = isUp ? (execution.yesTrade.filledSize ?? 0) : (execution.noTrade.filledSize ?? 0);
+      
+      if (filledSize === 0) continue;
+      
+      // Get current market price
+      const marketPrices = this.lastMarketPricesBySlug.get(opp.market.slug);
+      if (!marketPrices) continue;
+      
+      const currentBidPrice = isUp ? marketPrices.yesBestBid : marketPrices.noBestBid;
+      if (currentBidPrice === 0) continue; // No bid available
+      
+      // Calculate unrealized PnL
+      const unrealizedProfit = (currentBidPrice - entryPrice) * filledSize;
+      const entryCost = entryPrice * filledSize;
+      const pnlPercent = entryCost > 0 ? (unrealizedProfit / entryCost) : 0;
+      
+      let shouldExit = false;
+      let exitReason: "stop-loss" | null = null;
+      
+      // Check stop loss
+      if (stopLossPercent > 0 && pnlPercent <= -stopLossPercent) {
+        shouldExit = true;
+        exitReason = "stop-loss";
+      }
+      
+      if (shouldExit && exitReason) {
+        logger.info(`Exiting position: ${opp.market.slug} | ${exitReason} | PnL ${pnlPercent >= 0 ? "+" : ""}${(pnlPercent * 100).toFixed(1)}% ($${unrealizedProfit.toFixed(2)})`);
+        
+        try {
+          const sellResult = await this.trader.placeLimitSell(tokenId, currentBidPrice, filledSize, side);
+          if (sellResult.success && sellResult.filledSize && sellResult.filledSize > 0) {
+            const exitPrice = sellResult.price;
+            const actualProfit = (exitPrice - entryPrice) * sellResult.filledSize;
+            
+            execution.actualProfit = actualProfit;
+            execution.settled = true;
+            execution.lossCapped = exitReason === "stop-loss";
+            execution.profitTaken = false;
+            
+            this.lifetimeTotalProfit += actualProfit;
+            if (actualProfit > 0) this.lifetimeProfitableTrades++;
+            this._profitSyncDirty = true;
+            this.riskManager.recordSettlement(actualProfit);
+            
+            // Update trade record
+            const tradeId = this.getExecutionTradeId(execution);
+            if (tradeId) {
+              updateTradeSettlement(
+                tradeId,
+                actualProfit,
+                exchangePrice.price,
+                execution.lossCapped,
+                execution.profitTaken
+              );
+            }
+            
+            logger.info(`Position exited: ${opp.market.slug} | ${exitReason} | Profit $${actualProfit.toFixed(2)}`);
+          }
+        } catch (error) {
+          logger.error(`Failed to exit position ${opp.market.slug}: ${error}`);
+        }
+      }
+    }
   }
 
   /**
@@ -678,6 +845,7 @@ export class PolymarketArbBot {
       const tradeId = this.getExecutionTradeId(execution);
       if (tradeId && getTradeRecordById(tradeId)?.settled) {
         execution.settled = true;
+        execution.pendingSettlement = false;
         this.releasedPositionKeys.add(key);
         this.settlementEndPriceByKey.delete(key);
         this.settlementPriceFromChainlinkByKey.delete(key);
@@ -697,11 +865,13 @@ export class PolymarketArbBot {
       const polymarketResolved = resolvedByWindowEnd.get(market.endTime);
       
       if (!polymarketResolved || !polymarketResolved.outcome) {
-        // Polymarket hasn't confirmed yet - defer settlement
+        // Polymarket hasn't confirmed yet - defer settlement but release position from open count
         const existing = this.pendingSettlements.get(key);
         if (!existing) {
           this.pendingSettlements.set(key, { marketEndTime: market.endTime, lastChecked: Date.now() });
-          logger.debug(`Settlement deferred for ${market.slug}: waiting for Polymarket confirmation (windowEnd: ${market.endTime})`);
+          execution.pendingSettlement = true;
+          this.riskManager.releasePosition(); // Release from open count so we can trade in next window
+          logger.debug(`Settlement pending for ${market.slug}: waiting for Polymarket confirmation (windowEnd: ${market.endTime})`);
         } else {
           // Update last checked timestamp
           existing.lastChecked = Date.now();
@@ -747,6 +917,7 @@ export class PolymarketArbBot {
         logger.warn(`Settlement skipped for ${market.slug}: missing window start price, resolving as $0`);
         execution.actualProfit = 0;
         execution.settled = true;
+        execution.pendingSettlement = false;
         this._profitSyncDirty = true;
         this.riskManager.recordSettlement(0);
         if (tradeId) {
@@ -775,10 +946,12 @@ export class PolymarketArbBot {
       
       // Verify against Polymarket's outcome - use Polymarket as source of truth
       if (polymarketOutcome !== ourCalculatedOutcome) {
-        logger.warn("Outcome mismatch - using Polymarket outcome", {
+        const windowIso = new Date(market.endTime * 1000).toISOString();
+        logger.warn(
+          `Settlement: our prices said ${ourCalculatedOutcome} but Polymarket resolved ${polymarketOutcome} for window ${windowIso}. Using Polymarket result.`
+        );
+        logger.debug("Outcome mismatch detail", {
           windowEnd: market.endTime,
-          windowEndIso: new Date(market.endTime * 1000).toISOString(),
-          ourOutcome: ourCalculatedOutcome,
           ourPriceAtStart: windowStartBtcPrice,
           ourPriceAtEnd: priceAtEnd,
           polymarketOutcome,
@@ -798,6 +971,7 @@ export class PolymarketArbBot {
       
       execution.actualProfit = actualProfit;
       execution.settled = true;
+      execution.pendingSettlement = false;
       this.lifetimeTotalProfit += actualProfit;
       if (actualProfit > 0) this.lifetimeProfitableTrades++;
       this._profitSyncDirty = true;
@@ -828,9 +1002,12 @@ export class PolymarketArbBot {
         logger.debug(`Settlement: skipping historical record for ${market.slug} (price at end from exchange fallback, not Chainlink)`);
       }
 
+      const pnlStr = actualProfit >= 0 ? `+$${actualProfit.toFixed(2)}` : `$${actualProfit.toFixed(2)}`;
       logger.info(
-        `Settlement: ${market.slug} | Bet ${exchangeSignal} | BTC start=$${windowStartBtcPrice.toFixed(2)} end=$${priceAtEnd.toFixed(2)} | ` +
-          `Polymarket outcome=${polymarketOutcome} | ${ourSideWon ? "WON" : "LOST"} | PnL=$${actualProfit.toFixed(4)}`
+        `[Settlement] ${market.slug} | Bet ${exchangeSignal} | ${ourSideWon ? "WON" : "LOST"} | ${pnlStr}`
+      );
+      logger.debug(
+        `Settlement detail: BTC start=$${windowStartBtcPrice.toFixed(2)} end=$${priceAtEnd.toFixed(2)} | Polymarket outcome=${polymarketOutcome}`
       );
 
       // Clean up settlement tracking
@@ -939,6 +1116,7 @@ export class PolymarketArbBot {
       const settled = isDirectional
         ? this.releasedPositionKeys.has(releasedKey) || e.settled === true
         : e.fullyExecuted;
+      const pendingSettlement = e.pendingSettlement === true;
       const filledSize = side === "UP" ? (e.yesTrade.filledSize ?? 0) : (e.noTrade.filledSize ?? 0);
       const prices = this.lastMarketPricesBySlug.get(opp.market.slug);
       let unrealizedProfit: number | null = null;
@@ -952,6 +1130,7 @@ export class PolymarketArbBot {
         actualProfit: e.actualProfit,
         fullyExecuted: e.fullyExecuted,
         settled,
+        pendingSettlement,
         timestamp: opp.detectedAt,
         side,
         entry: entryStr,
@@ -1147,7 +1326,7 @@ export class PolymarketArbBot {
       return;
     }
 
-    logger.info(`Executing directional: ${toExecute.market.slug} (expected $${toExecute.totalExpectedProfit.toFixed(2)})`);
+    logger.info(`Opening position: ${toExecute.market.slug} (expected profit $${toExecute.totalExpectedProfit.toFixed(2)})`);
 
     const preExecuteNowSec = Math.floor(Date.now() / 1000);
     const remainingBeforeExecution = toExecute.market.endTime - preExecuteNowSec;
@@ -1164,7 +1343,7 @@ export class PolymarketArbBot {
     if (execution.fullyExecuted) {
       this.lifetimeTradesExecuted++;
       this.stats.directionalTradesExecuted++;
-      logger.info(`Trade executed: ${opportunity.market.slug} (PnL at settlement)`);
+      // "Position opened" is logged by the trader with size/cost details
     }
   }
 

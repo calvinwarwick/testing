@@ -36,9 +36,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: Number(optionalEnv("POLL_INTERVAL_MS", "1000")),
     dryRun,
     btc5mEventSlug: optionalEnv("POLYMARKET_BTC_5M_EVENT_SLUG", "") || undefined,
-    // Use PORT env var (Railway) or DASHBOARD_WS_PORT for local dev
-    // PORT is used for both HTTP (serving dashboard) and WebSocket
-    dashboardWsPort: Number(process.env.PORT || optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
+    dashboardWsPort: Number(process.env.PORT ?? optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
     maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "50")) || 50),
     sessionFile: optionalEnv("SESSION_FILE", "data/session.json") || undefined,
     minTimeBetweenTradesMs: Math.max(
@@ -57,6 +55,7 @@ export function loadConfig(): BotConfig {
     chainlinkDsApiSecret: optionalEnv("CHAINLINK_DS_API_SECRET", "") || undefined,
     chainlinkBtcUsdFeedId: optionalEnv("CHAINLINK_BTC_USD_FEED_ID", "") || undefined,
     kellyMultiplier: Math.max(0.05, Math.min(1.0, Number(optionalEnv("KELLY_MULTIPLIER", "0.25")) || 0.25)),
+    stopLossPercent: Math.max(0, Math.min(1, Number(optionalEnv("STOP_LOSS_PERCENT", "0.10")) || 0.10)),
   };
   return config;
 }

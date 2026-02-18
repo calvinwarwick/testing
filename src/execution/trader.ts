@@ -295,9 +295,8 @@ export class Trader {
     const price = isUp ? opportunity.yesPrice : opportunity.noPrice;
     const size = Math.max(1, Math.floor(opportunity.suggestedSize));
 
-    logger.info(
-      `Executing DIRECTIONAL ${targetSide} on ${opportunity.market.slug}: ` +
-        `${size} shares @ $${price.toFixed(3)} (bet: BTC ${opportunity.exchangeSignal})`
+    logger.debug(
+      `Placing order: ${targetSide} ${size} @ $${price.toFixed(3)} on ${opportunity.market.slug}`
     );
 
     const trade = await this.placeLimitBuy(tokenId, price, size, targetSide);
@@ -328,8 +327,7 @@ export class Trader {
         trade.orderId = tradeRecordId;
       }
       logger.info(
-        `DIRECTIONAL EXECUTED: ${targetSide} ${filledSize} @ $${price.toFixed(3)} | ` +
-          `Cost=$${actualTotalCost.toFixed(4)} | PnL at settlement`
+        `Position opened: ${opportunity.market.slug} | ${targetSide} ${filledSize} @ $${price.toFixed(2)} | cost $${actualTotalCost.toFixed(2)}`
       );
 
       // Record the trade
@@ -352,7 +350,7 @@ export class Trader {
       };
       recordTrade(tradeRecord);
     } else {
-      logger.warn(`DIRECTIONAL FAILED: ${targetSide} order did not fill`);
+      logger.warn(`Position not opened: ${opportunity.market.slug} — order did not fill`);
     }
 
     return execution;

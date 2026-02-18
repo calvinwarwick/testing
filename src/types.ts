@@ -53,6 +53,8 @@ export interface BotConfig {
   chainlinkBtcUsdFeedId?: string;
   /** Fractional Kelly multiplier for position sizing (default 0.25 = quarter-Kelly). Range [0.05, 1.0]. */
   kellyMultiplier?: number;
+  /** Stop loss threshold as % of entry cost (default 0.10 = 10% loss). Set to 0 to disable. */
+  stopLossPercent?: number;
 }
 
 /** Persisted session state for cross-restart tracking. */
@@ -178,6 +180,8 @@ export interface ArbitrageExecution {
   fullyExecuted: boolean;
   /** True once settlement/exit has been accounted exactly once */
   settled?: boolean;
+  /** True when window has ended but settlement is still pending (position released from open count) */
+  pendingSettlement?: boolean;
   /** Set when a directional loss was capped by stop-loss (dashboard can show "capped") */
   lossCapped?: boolean;
   /** Set when a position was exited early to lock in profit (trailing take-profit) */

@@ -1,7 +1,5 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import * as fs from "fs";
-import * as path from "path";
 
 /** Historical market record */
 export interface HistoricalMarketRecord {
@@ -62,6 +60,7 @@ export interface DashboardState {
     actualProfit: number;
     fullyExecuted: boolean;
     settled: boolean;
+    pendingSettlement?: boolean;
     timestamp: number;
     side: "UP" | "DOWN";
     entry: string;
@@ -99,147 +98,44 @@ export class DashboardServer {
   private wss: WebSocketServer | null = null;
   private clients: Set<WebSocket> = new Set();
   private lastState: DashboardState | null = null;
-  private dashboardDistPath: string;
 
-  constructor(private port: number) {
-    // Path to built dashboard static files
-    // When running from dist/index.js, __dirname is dist/, so ../dashboard/dist goes up one level to project root
-    this.dashboardDistPath = path.resolve(__dirname, "../dashboard/dist");
-  }
+  constructor(private port: number) {}
 
-  private serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse): void {
-    let filePath = req.url || "/";
-
-    // Default to index.html for root or non-file requests
-    if (filePath === "/" || !filePath.includes(".")) {
-      filePath = "/index.html";
-    }
-
-    // Remove query string and leading slash so path.join doesn't treat path as absolute (which would ignore dashboardDistPath on Unix)
-    const cleanPath = (filePath.split("?")[0] || "").replace(/^\//, "") || "index.html";
-    const fullPath = path.resolve(this.dashboardDistPath, cleanPath);
-
-    // Security: prevent directory traversal
-    if (!fullPath.startsWith(this.dashboardDistPath)) {
-      res.writeHead(403, { "Content-Type": "text/plain" });
-      res.end("Forbidden");
-      return;
-    }
-
-    // Check if file exists
-    if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
-      // Fallback to index.html for SPA routing
-      const indexPath = path.join(this.dashboardDistPath, "index.html");
-      if (fs.existsSync(indexPath)) {
-        try {
-          const content = fs.readFileSync(indexPath);
-          res.writeHead(200, { "Content-Type": "text/html" });
-          res.end(content);
-        } catch (err) {
-          console.warn(`Failed to read index.html: ${err}`);
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          res.end("Internal Server Error");
-        }
-      } else {
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end("Not Found");
-      }
-      return;
-    }
-
-    // Determine content type
-    const ext = path.extname(fullPath).toLowerCase();
-    const contentTypes: Record<string, string> = {
-      ".html": "text/html",
-      ".js": "application/javascript",
-      ".css": "text/css",
-      ".json": "application/json",
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".gif": "image/gif",
-      ".svg": "image/svg+xml",
-      ".ico": "image/x-icon",
-      ".woff": "font/woff",
-      ".woff2": "font/woff2",
-      ".ttf": "font/ttf",
-      ".eot": "application/vnd.ms-fontobject",
-    };
-
-    const contentType = contentTypes[ext] || "application/octet-stream";
+  start(): void {
+    if (this.port <= 0) return;
     try {
-      const content = fs.readFileSync(fullPath);
-      res.writeHead(200, { "Content-Type": contentType });
-      res.end(content);
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+      });
+      this.wss = new WebSocketServer({ noServer: true });
+      this.wss.on("connection", (ws) => {
+        this.clients.add(ws);
+        if (this.lastState) {
+          try {
+            ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
+          } catch (_) {}
+        }
+        ws.on("close", () => this.clients.delete(ws));
+        ws.on("error", () => this.clients.delete(ws));
+      });
+      server.on("upgrade", (req, socket, head) => {
+        this.wss!.handleUpgrade(req, socket, head, (ws) => {
+          this.wss!.emit("connection", ws, req);
+        });
+      });
+      server.listen(this.port, () => {
+        console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
+      });
+      this.httpServer = server;
+      this.httpServer.on("error", (err) => {
+        console.warn(`Dashboard server error: ${err}`);
+        this.stop();
+      });
     } catch (err) {
-      console.warn(`Failed to read file ${fullPath}: ${err}`);
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Internal Server Error");
+      console.warn(`Dashboard server failed to start on port ${this.port}: ${err}`);
+      return;
     }
-  }
-
-  start(): Promise<boolean> {
-    if (this.port <= 0) {
-      console.warn(`Dashboard server not started: invalid port ${this.port}`);
-      return Promise.resolve(false);
-    }
-    // Verify dashboard dist path exists
-    const distExists = fs.existsSync(this.dashboardDistPath);
-    if (!distExists) {
-      console.warn(`Dashboard dist directory not found at: ${this.dashboardDistPath}`);
-      console.warn("Dashboard will not be served. Run 'npm run build:dashboard' to build it.");
-    } else {
-      console.log(`Dashboard dist path: ${this.dashboardDistPath}`);
-    }
-
-    return new Promise<boolean>((resolve, reject) => {
-      try {
-        const server = http.createServer((req, res) => {
-          if (distExists) {
-            this.serveStaticFile(req, res);
-          } else {
-            res.writeHead(200, { "Content-Type": "text/plain" });
-            res.end("Dashboard not built. Run 'npm run build:dashboard' first.");
-          }
-        });
-        this.httpServer = server;
-        this.wss = new WebSocketServer({ noServer: true });
-        this.wss.on("connection", (ws) => {
-          this.clients.add(ws);
-          if (this.lastState) {
-            try {
-              ws.send(JSON.stringify({ type: "state", payload: this.lastState }));
-            } catch (_) {}
-          }
-          ws.on("close", () => this.clients.delete(ws));
-          ws.on("error", () => this.clients.delete(ws));
-        });
-        server.on("upgrade", (req, socket, head) => {
-          this.wss!.handleUpgrade(req, socket, head, (ws) => {
-            this.wss!.emit("connection", ws, req);
-          });
-        });
-
-        // Attach error handler before listen so listen failures are caught
-        server.on("error", (err) => {
-          console.error(`Dashboard server error: ${err}`);
-          if (this.httpServer && this.httpServer.listening) {
-            this.stop();
-          } else {
-            // Listen failed (e.g. EADDRINUSE) – report startup failure
-            resolve(false);
-          }
-        });
-
-        server.listen(this.port, "0.0.0.0", () => {
-          console.log(`Dashboard server listening on port ${this.port} (HTTP + WebSocket)`);
-          resolve(true);
-        });
-      } catch (err) {
-        console.error(`Dashboard server failed to start on port ${this.port}: ${err}`);
-        resolve(false);
-      }
-    });
   }
 
   stop(): void {

@@ -4,9 +4,7 @@
   "description": "Polymarket 5-minute crypto market arbitrage bot - exploits price delays between exchanges and Polymarket",
   "main": "dist/index.js",
   "scripts": {
-    "build": "npm run build:bot && npm run build:dashboard",
-    "build:bot": "tsc",
-    "build:dashboard": "cd dashboard && npm install && npm run build",
+    "build": "tsc",
     "start": "node dist/index.js",
     "dev": "concurrently -n bot,dashboard -c cyan,magenta \"npm run dev:bot\" \"npm run dev:dashboard\"",
     "dev:bot": "ts-node src/index.ts",

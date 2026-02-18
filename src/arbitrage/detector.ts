@@ -113,10 +113,12 @@ export class ArbitrageDetector {
       signal === "UP" ? marketPrices.noBestAsk : marketPrices.yesBestAsk;
     const totalCost = targetAsk + otherAsk;
 
+    const direction = signal === "UP" ? "UP" : "DOWN";
     logger.info(
-      `DIRECTIONAL: ${targetToken} on ${marketPrices.market.slug} | ` +
-        `Ask=$${targetAsk.toFixed(3)} vs Fair=$${estimatedFairPrice.toFixed(3)} | ` +
-        `Edge: ${edgePercent.toFixed(1)}% | Kelly: ${(kellyFraction * 100).toFixed(1)}% | Exchange move: ${pctMove.toFixed(3)}%`
+      `Position detected: bet ${direction} on ${marketPrices.market.slug} | entry $${targetAsk.toFixed(2)}, edge ${edgePercent.toFixed(1)}%`
+    );
+    logger.debug(
+      `Detection detail: Fair=$${estimatedFairPrice.toFixed(3)} | Kelly: ${(kellyFraction * 100).toFixed(1)}% | Exchange move: ${pctMove.toFixed(3)}%`
     );
 
     // suggestedSize is a max-position fallback; actual sizing uses Kelly in demo-capital

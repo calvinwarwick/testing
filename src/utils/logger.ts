@@ -54,50 +54,37 @@ class DashboardTransport extends Transport {
   }
 }
 
-// Ensure directories exist (non-throwing so Railway/read-only fs doesn't crash startup)
-function ensureDir(dir: string): boolean {
-  try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    return true;
-  } catch {
-    return false;
+// Ensure directories exist
+function ensureDir(dir: string): void {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
+ensureDir(DATA_DIR);
+ensureDir(LOGS_DIR);
 
-const logsDirOk = ensureDir(DATA_DIR) && ensureDir(LOGS_DIR);
-
-// Daily rotating file transport - only if logs dir is writable (skip on read-only fs e.g. some Railway setups)
-const dailyRotateTransport = logsDirOk
-  ? new (winston.transports as any).DailyRotateFile({
-      filename: `${LOGS_DIR}/bot-%DATE%.log`,
-      datePattern: "YYYY-MM-DD",
-      maxFiles: null,
-      maxSize: null,
-    })
-  : null;
-
-const fileTransports: Transport[] = [
-  new winston.transports.Console({
-    format: combine(colorize(), timestamp({ format: "HH:mm:ss.SSS" }), botFormat),
-  }),
-  new DashboardTransport(),
-];
-if (dailyRotateTransport) fileTransports.push(dailyRotateTransport);
-if (logsDirOk) {
-  fileTransports.push(
-    new winston.transports.File({
-      filename: `${LOGS_DIR}/bot-error.log`,
-      level: "error",
-    })
-  );
-}
+// Daily rotating file transport - keeps logs forever
+const dailyRotateTransport = new (winston.transports as any).DailyRotateFile({
+  filename: `${LOGS_DIR}/bot-%DATE%.log`,
+  datePattern: "YYYY-MM-DD",
+  maxFiles: null, // Keep forever
+  maxSize: null, // No size limit
+});
 
 export const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || "info",
   format: combine(timestamp({ format: "YYYY-MM-DD HH:mm:ss.SSS" }), botFormat),
-  transports: fileTransports,
+  transports: [
+    new winston.transports.Console({
+      format: combine(colorize(), timestamp({ format: "HH:mm:ss.SSS" }), botFormat),
+    }),
+    dailyRotateTransport,
+    new winston.transports.File({
+      filename: `${LOGS_DIR}/bot-error.log`,
+      level: "error",
+    }),
+    new DashboardTransport(),
+  ],
 });
 
 // ============== TRADE RECORDING ==============
@@ -156,7 +143,8 @@ export function updateTradeSettlement(
   trade.settled = true;
   trade.settledAt = Date.now();
   trade.profit = profit;
-  trade.outcome = profit > 0 ? "win" : "loss";
+  // Outcome: win if profit > 0, loss if profit < 0, undefined if exactly $0
+  trade.outcome = profit > 0 ? "win" : profit < 0 ? "loss" : undefined;
   trade.btcPriceAtSettlement = btcPriceAtSettlement;
   if (lossCapped != null) trade.lossCapped = lossCapped;
   if (profitTaken != null) trade.profitTaken = profitTaken;
@@ -191,8 +179,10 @@ export function getTradeStats(): {
   totalProfit: number;
 } {
   const settled = tradeRecords.filter((t) => t.settled);
-  const wins = settled.filter((t) => t.outcome === "win").length;
-  const losses = settled.filter((t) => t.outcome === "loss").length;
+  // Win = profitable trade (profit > 0), Loss = losing trade (profit < 0)
+  // Trades with exactly $0 profit are excluded from win/loss counts
+  const wins = settled.filter((t) => (t.profit ?? 0) > 0).length;
+  const losses = settled.filter((t) => (t.profit ?? 0) < 0).length;
   const totalProfit = settled.reduce((sum, t) => sum + (t.profit ?? 0), 0);
   return {
     total: tradeRecords.length,

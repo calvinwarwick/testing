@@ -1,12 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// WebSocket URL: use VITE_WS_URL if set, otherwise construct from current location
-// In production (Railway), WebSocket uses same hostname/port as HTTP (wss:// for HTTPS, ws:// for HTTP)
+const WS_PORT = "8765";
 const WS_URL =
   import.meta.env.VITE_WS_URL ||
   (typeof window !== "undefined"
-    ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname}${window.location.port ? `:${window.location.port}` : ""}`
-    : `ws://localhost:8765`);
+    ? `ws://${window.location.hostname}:${WS_PORT}`
+    : `ws://localhost:${WS_PORT}`);
 const MAX_LOGS = 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 const MAX_BTC_POINTS_5M = 60; // ~1 point per 5s over 5m
@@ -78,6 +77,7 @@ export interface BotState {
     actualProfit: number;
     fullyExecuted: boolean;
     settled: boolean;
+    pendingSettlement?: boolean;
     timestamp: number;
     side: "UP" | "DOWN";
     entry: string;

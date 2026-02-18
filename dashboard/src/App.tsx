@@ -176,7 +176,9 @@ function getTradingStats(list: ExecutionLike[]) {
   const profitFactor =
     grossLoss < 0 ? (grossProfit / Math.abs(grossLoss)) : (wins.length > 0 ? Infinity : 0);
   const expectancy = settled.length > 0 ? totalPnl / settled.length : 0;
-  const winRatePct = settled.length > 0 ? (wins.length / settled.length) * 100 : 0;
+  // Win rate = wins / (wins + losses) - only count profitable vs losing trades
+  const totalWinLossTrades = wins.length + losses.length;
+  const winRatePct = totalWinLossTrades > 0 ? (wins.length / totalWinLossTrades) * 100 : 0;
 
   const bySide = { UP: { count: 0, wins: 0, losses: 0, pnl: 0 }, DOWN: { count: 0, wins: 0, losses: 0, pnl: 0 } };
   settled.forEach((e) => {
@@ -246,7 +248,7 @@ const POSITION_FOOTER_PX = 46;
 const POSITION_SAFETY_PX = 8;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 
-type PositionsTab = "open" | "closed";
+type PositionsTab = "open" | "pending" | "closed";
 
 const LOG_CATEGORIES = ["all", "trade", "settlement", "risk", "error", "warn", "info", "debug"] as const;
 type LogCategory = typeof LOG_CATEGORIES[number];
@@ -314,7 +316,7 @@ export default function App() {
   const executions = state?.executions ?? [];
   const openTradesValue =
     executions
-      .filter((e) => e.fullyExecuted && !e.settled)
+      .filter((e) => e.fullyExecuted && !e.settled && !e.pendingSettlement)
       .reduce((sum, e) => sum + orderValueDollars(e.entry, e.size), 0) ?? 0;
   const tradesWon = state?.stats?.profitableTrades ?? executions.filter((e) => e.settled && e.actualProfit > 0).length;
   const avgTrade =
@@ -329,21 +331,20 @@ export default function App() {
     state?.windowStartBtcPrice != null &&
     state?.btcPrice != null &&
     state?.currentMarketPrices != null;
-  const windowStartBtcPrice = state?.windowStartBtcPrice ?? null;
-  const cexProbability = hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null
+  const cexProbability = hasEdgeInputs
     ? Math.min(
         0.8,
         0.5 +
           (Math.abs(
-            ((btcPrice - windowStartBtcPrice!) / windowStartBtcPrice!) *
+            ((state.btcPrice - state.windowStartBtcPrice) / state.windowStartBtcPrice) *
               100
           ) *
             0.4)
       ) * 100
     : null;
   const exchangeSignal =
-    hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null && btcPrice !== windowStartBtcPrice
-      ? btcPrice > windowStartBtcPrice!
+    hasEdgeInputs && state.btcPrice !== state.windowStartBtcPrice
+      ? state.btcPrice > state.windowStartBtcPrice
         ? "UP"
         : "DOWN"
       : null;
@@ -358,9 +359,9 @@ export default function App() {
       ? cexProbability - polymarketProbability
       : null;
   const sigma =
-    hasEdgeInputs && btcPrice != null && windowStartBtcPrice != null && windowStartBtcPrice > 0
+    hasEdgeInputs && state.windowStartBtcPrice > 0
       ? Math.abs(
-          ((btcPrice - windowStartBtcPrice!) / windowStartBtcPrice!) *
+          ((state.btcPrice - state.windowStartBtcPrice) / state.windowStartBtcPrice) *
             100
         ) / 0.15
       : null;
@@ -1085,6 +1086,13 @@ export default function App() {
               </button>
               <button
                 type="button"
+                onClick={() => { setPositionsTab("pending"); setPositionsPage(0); }}
+                className={`px-3 py-1.5 text-xs font-medium ${positionsTab === "pending" ? "bg-subtle text-primary" : "text-muted hover:text-primary"}`}
+              >
+                Pending
+              </button>
+              <button
+                type="button"
                 onClick={() => { setPositionsTab("closed"); setPositionsPage(0); }}
                 className={`px-3 py-1.5 text-xs font-medium ${positionsTab === "closed" ? "bg-subtle text-primary" : "text-muted hover:text-primary"}`}
               >
@@ -1107,7 +1115,10 @@ export default function App() {
                 return window != null ? window.end <= nowSec : true;
               };
               const openList = executions.filter(
-                (e) => e.fullyExecuted && !e.settled && !isExpired(e)
+                (e) => e.fullyExecuted && !e.settled && !e.pendingSettlement && !isExpired(e)
+              );
+              const pendingList = executions.filter(
+                (e) => e.fullyExecuted && e.pendingSettlement === true && !e.settled
               );
               // Closed tab: use full trade history when available, else current run's closed executions
               const closedFromHistory =
@@ -1117,7 +1128,7 @@ export default function App() {
               const closedList =
                 closedFromHistory ??
                 executions.filter((e) => e.settled || isExpired(e));
-              const list = positionsTab === "open" ? openList : closedList;
+              const list = positionsTab === "open" ? openList : positionsTab === "pending" ? pendingList : closedList;
               const displayList =
                 positionsTab === "closed" && closedFromHistory
                   ? closedFromHistory
@@ -1136,6 +1147,8 @@ export default function App() {
                   <div className="text-muted text-sm p-4">
                     {positionsTab === "open"
                       ? "No open positions."
+                      : positionsTab === "pending"
+                      ? "No pending settlements."
                       : "No closed positions yet."}
                   </div>
                 );
@@ -1148,6 +1161,7 @@ export default function App() {
                       const entryCents = parseFloat(String(e.entry).replace(/[^\d.]/g, "")) || 0;
                       const entryUsd = entryCents / 100;
                       const isOpen = positionsTab === "open";
+                      const isPending = positionsTab === "pending";
                       const displayProfit = isOpen && e.unrealizedProfit != null ? e.unrealizedProfit : e.actualProfit;
                       const showLive = isOpen && e.unrealizedProfit != null;
                       const normalizedWindow = normalizedWindowRange(
@@ -1185,16 +1199,18 @@ export default function App() {
                             <div className="flex items-center gap-2 text-muted text-xs font-mono">
                               <span>{formatUsdSmall(orderValue)} @ {formatUsdSmall(entryUsd)}</span>
                               <span className="text-gray-600">|</span>
-                              <span className={e.lossCapped ? "text-negative" : (e.profitTaken || e.settled) ? "text-positive" : ""}>
+                              <span className={e.lossCapped ? "text-negative" : (e.profitTaken || e.settled) ? "text-positive" : e.pendingSettlement ? "text-muted" : ""}>
                                 {e.lossCapped
                                   ? "Stopped X"
                                   : e.profitTaken
                                     ? "Profit \u2713"
                                     : e.settled
                                       ? "Resolved \u2713"
-                                      : e.fullyExecuted
-                                        ? "Open"
-                                        : "partial"}
+                                      : e.pendingSettlement
+                                        ? "Pending..."
+                                        : e.fullyExecuted
+                                          ? "Open"
+                                          : "partial"}
                               </span>
                             </div>
                           </div>
