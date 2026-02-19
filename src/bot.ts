@@ -75,6 +75,10 @@ export class PolymarketArbBot {
   private activeMarkets: PolymarketMarket[] = [];
   private executions: ArbitrageExecution[] = [];
   private releasedPositionKeys = new Set<string>();
+  /** Log "Endgame arb: opening" at most once per market per window (slug-endTime) to avoid repeated logs */
+  private endgameLoggedForMarket = new Set<string>();
+  /** Log "Endgame skipped" at most once per market per window so user sees why we didn't open */
+  private endgameSkippedLoggedForMarket = new Set<string>();
   /** BTC price at first cycle after window end, per execution key (so settlement uses correct resolution price) */
   private settlementEndPriceByKey = new Map<string, number>();
   /** Keys for which the locked settlement price came from Chainlink (not exchange fallback). Used to avoid recording non-oracle outcomes. */
@@ -585,6 +589,9 @@ export class PolymarketArbBot {
       logger.debug("No exchange price available yet");
       return;
     }
+
+    // Record price sample for momentum analysis
+    this.detector.recordPriceSample(exchangePrice.price);
     const priceAgeMs = Date.now() - exchangePrice.timestamp;
     if (priceAgeMs > MAX_EXCHANGE_PRICE_AGE_MS) {
       logger.warn(
@@ -684,25 +691,71 @@ export class PolymarketArbBot {
         noBestAskSize: prices.noBestAskSize,
       });
 
-      // --- Directional edge only ---
       // Skip markets where we don't have the actual window start price.
       if (actualWindowStartPrice == null) {
         logger.debug(`Skipping ${market.slug}: no window start price captured`);
         continue;
       }
 
-      const minEdge = this.config.minEdgePercent ?? 10;
-      const signalThreshold = this.config.exchangeSignalThresholdPercent ?? 0.03;
-      const minMove = this.config.minExchangeMovePercent ?? 0.15;
+      this.detector.setWindowReference(actualWindowStartPrice, market.startTime);
+      const secondsRemaining = market.endTime - nowSec;
+
+      // --- Endgame arb: near-certain side close to resolution ---
+      const endgameEnabled = this.config.endgameArbEnabled ?? true;
+      const endgameMaxSec = this.config.endgameMaxSecondsRemaining ?? 60;
+      const endgameMinSec = this.config.endgameMinSecondsRemaining ?? 5;
+      const inEndgameWindow =
+        secondsRemaining <= endgameMaxSec && secondsRemaining >= endgameMinSec;
+
+      if (endgameEnabled && inEndgameWindow) {
+        const endgameOpp = this.detector.detectEndgameOpportunity(
+          prices,
+          exchangePrice,
+          secondsRemaining,
+          {
+            endgameMinProbability: this.config.endgameMinProbability ?? 0.85,
+            endgameMaxAsk: this.config.endgameMaxAsk ?? 0.98,
+            minAskSizeShares: this.config.minAskSizeShares ?? 50,
+          }
+        );
+        if (endgameOpp) {
+          endgameOpp.windowStartBtcPrice = actualWindowStartPrice;
+          await this.handleOpportunity(endgameOpp);
+          continue;
+        }
+      }
+
+      // --- Directional edge ---
+      const minEdge = this.config.minEdgePercent ?? 5;
+      let signalThreshold = this.config.exchangeSignalThresholdPercent ?? 0.02;
+      let minMove = this.config.minExchangeMovePercent ?? 0.03;
+      const minWinProbability = this.config.minWinProbability ?? 0.52;
+      const minAskSize = this.config.minAskSizeShares ?? 30;
+
+      // Adjust thresholds based on rolling BTC volatility (capped so high vol doesn't over-tighten)
+      const volatility = this.exchangeFeed.getVolatility();
+      if (volatility != null) {
+        // Baseline: ~0.02% stdev for BTC 2-second returns in normal conditions
+        const baselineVol = 0.02;
+        const volRatio = volatility / baselineVol;
+        const adjustmentFactor = Math.max(0.6, Math.min(1.3, 0.5 + volRatio * 0.5));
+        signalThreshold *= adjustmentFactor;
+        minMove *= adjustmentFactor;
+        if (Math.abs(volRatio - 1.0) > 0.3) {
+          logger.debug(`Volatility adjustment: vol=${volatility.toFixed(4)}% ratio=${volRatio.toFixed(2)}x, thresholds ${adjustmentFactor.toFixed(2)}x`);
+        }
+      }
       const directionalOpp = this.detector.detectDirectionalOpportunity(
         prices,
         exchangePrice,
         minEdge,
         signalThreshold,
-        minMove
+        minMove,
+        secondsRemaining,
+        minWinProbability,
+        minAskSize
       );
       if (directionalOpp) {
-        // Override with the actual window start price for correct settlement.
         directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
         await this.handleOpportunity(directionalOpp);
       }
@@ -1250,6 +1303,15 @@ export class PolymarketArbBot {
     });
   }
 
+  /** Log once per market per window when we skip an endgame opportunity so user sees why nothing opened. */
+  private logEndgameSkippedOnce(slug: string, endTime: number, reason: string): void {
+    const key = `${slug}-${endTime}`;
+    if (!this.endgameSkippedLoggedForMarket.has(key)) {
+      this.endgameSkippedLoggedForMarket.add(key);
+      logger.info(`Endgame skipped for ${slug}: ${reason}`);
+    }
+  }
+
   /**
    * Handle a detected opportunity: risk check, then execute.
    */
@@ -1264,13 +1326,38 @@ export class PolymarketArbBot {
       );
       return;
     }
-    const minSecLeft = this.config.minSecondsRemainingInWindow ?? 10;
     const marketSecondsRemaining = opportunity.market.endTime - nowSec;
-    if (marketSecondsRemaining < minSecLeft) {
-      logger.debug(
-        `Skip directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s)`
-      );
-      return;
+    const isEndgame = opportunity.opportunityType === "endgame";
+
+    if (isEndgame) {
+      const endgameMaxSec = this.config.endgameMaxSecondsRemaining ?? 60;
+      const endgameMinSec = this.config.endgameMinSecondsRemaining ?? 5;
+      if (
+        marketSecondsRemaining > endgameMaxSec ||
+        marketSecondsRemaining < endgameMinSec
+      ) {
+        this.logEndgameSkippedOnce(
+          opportunity.market.slug,
+          opportunity.market.endTime,
+          `outside time window (${marketSecondsRemaining}s left, need [${endgameMinSec}, ${endgameMaxSec}])`
+        );
+        return;
+      }
+    } else {
+      const minSecLeft = this.config.minSecondsRemainingInWindow ?? 15;
+      const maxSecLeft = this.config.maxSecondsRemainingInWindow ?? 270;
+      if (marketSecondsRemaining < minSecLeft) {
+        logger.debug(
+          `Skip directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s)`
+        );
+        return;
+      }
+      if (marketSecondsRemaining > maxSecLeft) {
+        logger.debug(
+          `Skip directional: too early in window (${marketSecondsRemaining}s remaining, max ${maxSecLeft}s)`
+        );
+        return;
+      }
     }
 
     let toExecute = opportunity;
@@ -1291,7 +1378,11 @@ export class PolymarketArbBot {
         kellyMultiplier: this.config.kellyMultiplier,
       });
       if (!decision.allowed) {
-        logger.debug(`Skip trade: demo capital — ${decision.reason}`);
+        if (isEndgame) {
+          this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, `demo capital — ${decision.reason}`);
+        } else {
+          logger.debug(`Skip trade: demo capital — ${decision.reason}`);
+        }
         return;
       }
 
@@ -1309,19 +1400,39 @@ export class PolymarketArbBot {
       }
     }
 
+    // Cap order size to available liquidity at best ask
+    const marketPricesForSize = this.lastMarketPricesBySlug.get(toExecute.market.slug);
+    if (marketPricesForSize) {
+      const isUp = toExecute.exchangeSignal === "UP";
+      const availableSize = isUp ? marketPricesForSize.yesBestAskSize : marketPricesForSize.noBestAskSize;
+      if (availableSize != null && toExecute.suggestedSize > availableSize) {
+        const cappedSize = Math.max(1, Math.floor(availableSize));
+        toExecute = {
+          ...toExecute,
+          suggestedSize: cappedSize,
+          totalExpectedProfit: toExecute.profitPerShare * cappedSize,
+        };
+        logger.debug(`Capped size to available liquidity: ${cappedSize} shares (available: ${availableSize})`);
+      }
+    }
+
     this.stats.opportunitiesFound++;
 
     // Risk check
     const riskCheck = this.riskManager.checkTrade(toExecute);
     if (!riskCheck.allowed) {
       const reason = riskCheck.reason ?? "";
-      const isExpectedLimit =
-        reason.includes("Min time between trades") ||
-        reason.includes("Max open positions reached");
-      if (isExpectedLimit) {
-        logger.debug(`Trade blocked by risk: ${reason}`);
+      if (isEndgame) {
+        this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, reason);
       } else {
-        logger.warn(`Trade blocked by risk: ${reason}`);
+        const isExpectedLimit =
+          reason.includes("Min time between trades") ||
+          reason.includes("Max open positions reached");
+        if (isExpectedLimit) {
+          logger.debug(`Trade blocked by risk: ${reason}`);
+        } else {
+          logger.warn(`Trade blocked by risk: ${reason}`);
+        }
       }
       return;
     }
@@ -1331,8 +1442,23 @@ export class PolymarketArbBot {
     const preExecuteNowSec = Math.floor(Date.now() / 1000);
     const remainingBeforeExecution = toExecute.market.endTime - preExecuteNowSec;
     if (remainingBeforeExecution <= EXECUTION_END_BUFFER_SEC) {
-      logger.debug(`Skip trade: ${toExecute.market.slug} too close to end (${remainingBeforeExecution}s)`);
+      if (isEndgame) {
+        this.logEndgameSkippedOnce(toExecute.market.slug, toExecute.market.endTime, `too close to end (${remainingBeforeExecution}s)`);
+      } else {
+        logger.debug(`Skip trade: ${toExecute.market.slug} too close to end (${remainingBeforeExecution}s)`);
+      }
       return;
+    }
+
+    if (toExecute.opportunityType === "endgame") {
+      const logKey = `${toExecute.market.slug}-${toExecute.market.endTime}`;
+      if (!this.endgameLoggedForMarket.has(logKey)) {
+        this.endgameLoggedForMarket.add(logKey);
+        const entryPrice = toExecute.exchangeSignal === "UP" ? toExecute.yesPrice : toExecute.noPrice;
+        logger.info(
+          `Endgame arb: opening ${toExecute.exchangeSignal} on ${toExecute.market.slug} | entry $${entryPrice.toFixed(2)}, ~${toExecute.profitPercent.toFixed(1)}% if win, ${remainingBeforeExecution}s left`
+        );
+      }
     }
 
     const execution = await this.trader.executeDirectional(toExecute);

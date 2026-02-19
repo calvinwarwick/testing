@@ -46,7 +46,7 @@ function makeMockExchangePrice(price: number): ExchangePrice {
 describe("Directional Strategy Simulation", () => {
   let detector: ArbitrageDetector;
   const BASE_BTC_PRICE = 70000;
-  const MIN_EDGE = 10; // 10%
+  const MIN_EDGE = 5; // 5% (accounts for ~3% dynamic taker fee reducing effective edge)
   const SIGNAL_THRESHOLD = 0.12; // 0.12%
   const MIN_MOVE = 0.15; // 0.15%
 
@@ -57,8 +57,8 @@ describe("Directional Strategy Simulation", () => {
   it("should estimate fair price correctly based on BTC move", () => {
     detector.setWindowReference(BASE_BTC_PRICE, Math.floor(Date.now() / 1000));
 
-    // 0.2% BTC move up -> fair price should be 0.5 + 0.2 * 0.4 = 0.58
-    const btcPrice = BASE_BTC_PRICE * 1.002; // +0.2%
+    // 0.25% BTC move up -> fair price = min(0.75, 0.48 + 0.25 * 0.35) = 0.5675
+    const btcPrice = BASE_BTC_PRICE * 1.0025; // +0.25%
     const market = makeMockMarket(Date.now() / 1000, Date.now() / 1000 + 300);
     const prices = makeMockPrices(market, 0.50, 0.50);
     const exchangePrice = makeMockExchangePrice(btcPrice);
@@ -73,9 +73,11 @@ describe("Directional Strategy Simulation", () => {
 
     expect(opp).not.toBeNull();
     expect(opp!.exchangeSignal).toBe("UP");
-    // Fair price = 0.5 + 0.2 * 0.4 = 0.58
-    // Edge = (0.58 - 0.50) / 0.50 = 16%
-    expect(opp!.profitPercent).toBeCloseTo(16, 0);
+    // Fair price = 0.48 + 0.25 * 0.35 = 0.5675
+    // Fee rate at $0.50 = 3.15%, feePerShare = 0.0315 * 0.50 = 0.01575
+    // Post-fee edge = 0.5675 - 0.50 - 0.5675 * 0.01575 ≈ 0.0586
+    // Edge % = 0.0586 / 0.50 * 100 ≈ 11.7%
+    expect(opp!.profitPercent).toBeCloseTo(11.7, 0);
   });
 
   it("should detect DOWN signal when BTC drops", () => {

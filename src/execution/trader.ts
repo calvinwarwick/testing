@@ -7,6 +7,7 @@ import {
   BotConfig,
   TradeRecord,
 } from "../types";
+import { ArbitrageDetector } from "../arbitrage/detector";
 import { logger, recordTrade } from "../utils/logger";
 
 /**
@@ -151,13 +152,16 @@ export class Trader {
 
     try {
       // Build the order payload for the CLOB
+      // feeRateBps must be >= dynamic taker fee for order acceptance
+      const feeRate = ArbitrageDetector.estimateDynamicFeeRate(price);
+      const feeRateBps = Math.ceil(feeRate * 10000).toString();
       const orderPayload = {
         tokenID: tokenId,
         price: price.toFixed(4),
         size: size.toString(),
         side: "BUY" as const,
         type: "GTC",
-        feeRateBps: "0",
+        feeRateBps,
       };
 
       // Sign the order (EIP-712 typed data)
@@ -215,13 +219,15 @@ export class Trader {
     }
 
     try {
+      const feeRate = ArbitrageDetector.estimateDynamicFeeRate(price);
+      const feeRateBps = Math.ceil(feeRate * 10000).toString();
       const orderPayload = {
         tokenID: tokenId,
         price: price.toFixed(4),
         size: size.toString(),
         side: "SELL" as const,
         type: "GTC",
-        feeRateBps: "0",
+        feeRateBps,
       };
       const signedOrder = await this.signOrder(orderPayload);
       const response = await this.httpClient.post(

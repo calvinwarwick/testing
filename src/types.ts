@@ -27,20 +27,24 @@ export interface BotConfig {
   maxOpenPositions?: number;
   /** Path to session persistence file (e.g. data/session.json) */
   sessionFile?: string;
-  /** Min ms between trades (default 2000) */
+  /** Min ms between trades (default 1000) */
   minTimeBetweenTradesMs?: number;
   /** Max trades per minute (default 50). Rate limit to prevent runaway trading. */
   maxTradesPerMinute?: number;
   /** If true, only take directional trades (exchange vs Polymarket). */
   directionalOnly?: boolean;
-  /** Min edge % for directional opportunities (default 10). Only enter when edge is clearly there. */
+  /** Min edge % for directional opportunities (default 5). Only enter when edge is clearly there. */
   minEdgePercent?: number;
-  /** Exchange price must move this % vs window start for UP/DOWN signal (default 0.03 = 3%). Higher = fewer, stronger signals. */
+  /** Exchange price must move this % vs window start for UP/DOWN signal (default 0.02). Higher = fewer, stronger signals. */
   exchangeSignalThresholdPercent?: number;
-  /** For directional, require at least this % exchange move (default 0.15). Avoids trading on noise. */
+  /** For directional, require at least this % exchange move (default 0.03). Avoids trading on noise. */
   minExchangeMovePercent?: number;
-  /** Don't open new directional trades when less than this many seconds left in window (default 10). */
+  /** Don't open new directional trades when less than this many seconds left in window (default 15). */
   minSecondsRemainingInWindow?: number;
+  /** Don't open new directional trades when more than this many seconds left (default 270; use 300 to allow first 60s). */
+  maxSecondsRemainingInWindow?: number;
+  /** Minimum estimated win probability to enter a trade (default 0.52 = 52%). Higher = more selective. */
+  minWinProbability?: number;
   /** Demo starting balance in USD when dry run (default 1000). Used for display and 5% max per trade. */
   demoStartingBalance?: number;
   /** If true, refuse simulation fallback and require live Polymarket market data. */
@@ -51,10 +55,22 @@ export interface BotConfig {
   chainlinkDsApiSecret?: string;
   /** Optional: Chainlink Data Streams BTC/USD feed ID (hex). If unset and Chainlink is configured, resolved via listFeeds() or default constant. */
   chainlinkBtcUsdFeedId?: string;
-  /** Fractional Kelly multiplier for position sizing (default 0.25 = quarter-Kelly). Range [0.05, 1.0]. */
+  /** Fractional Kelly multiplier for position sizing (default 0.4). Range [0.05, 1.0]. */
   kellyMultiplier?: number;
   /** Stop loss threshold as % of entry cost (default 0.10 = 10% loss). Set to 0 to disable. */
   stopLossPercent?: number;
+  /** Minimum shares available at best ask to consider a trade (default 30). */
+  minAskSizeShares?: number;
+  /** If true, allow endgame arb: buy near-certain side close to resolution (default true). */
+  endgameArbEnabled?: boolean;
+  /** Only consider endgame when this many seconds or fewer remain (default 60). */
+  endgameMaxSecondsRemaining?: number;
+  /** Require at least this many seconds left for execution (default 5). */
+  endgameMinSecondsRemaining?: number;
+  /** Endgame: target side must be at least this price, e.g. 0.85 (default 0.85). */
+  endgameMinProbability?: number;
+  /** Endgame: pay at most this price so we have profit if we win, e.g. 0.98 (default 0.98). */
+  endgameMaxAsk?: number;
 }
 
 /** Persisted session state for cross-restart tracking. */
@@ -149,10 +165,14 @@ export interface ArbitrageOpportunity {
   windowStartBtcPrice?: number;
   /** Time detected */
   detectedAt: number;
+  /** When set, distinguishes endgame vs directional for time-window and reporting. */
+  opportunityType?: "directional" | "endgame";
   /** Kelly Criterion optimal fraction of bankroll (0..1) */
   kellyFraction?: number;
   /** Estimated win probability used for Kelly calculation */
   estimatedWinProbability?: number;
+  /** Estimated dynamic taker fee as a percentage (e.g. 3.15 = 3.15%) */
+  estimatedFeePercent?: number;
 }
 
 /** Result of an executed trade */

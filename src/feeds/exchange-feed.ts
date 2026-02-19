@@ -24,6 +24,11 @@ export class ExchangeFeed {
   private restInterval: ReturnType<typeof setInterval> | null = null;
   private restFetchInProgress = false;
 
+  /** Rolling price samples for volatility calculation */
+  private priceSamples: { price: number; timestamp: number }[] = [];
+  private static readonly VOLATILITY_WINDOW_MS = 600_000; // 10 minutes
+  private static readonly MAX_VOLATILITY_SAMPLES = 300;
+
   private readonly binanceWsUrl =
     "wss://stream.binance.com:9443/ws/btcusdt@ticker";
   private readonly binanceRestUrl =
@@ -138,6 +143,40 @@ export class ExchangeFeed {
     return out;
   }
 
+  /**
+   * Get rolling BTC price volatility as standard deviation of percentage returns.
+   * Returns null if insufficient data (< 10 samples).
+   */
+  getVolatility(): number | null {
+    if (this.priceSamples.length < 10) return null;
+
+    const returns: number[] = [];
+    for (let i = 1; i < this.priceSamples.length; i++) {
+      const ret = (this.priceSamples[i].price - this.priceSamples[i - 1].price)
+                  / this.priceSamples[i - 1].price * 100;
+      returns.push(ret);
+    }
+
+    const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+    const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
+    return Math.sqrt(variance);
+  }
+
+  private recordPriceSample(): void {
+    if (!this.aggregated) return;
+    const now = Date.now();
+    this.priceSamples.push({ price: this.aggregated.price, timestamp: now });
+
+    // Evict old samples
+    const cutoff = now - ExchangeFeed.VOLATILITY_WINDOW_MS;
+    while (this.priceSamples.length > 0 && this.priceSamples[0].timestamp < cutoff) {
+      this.priceSamples.shift();
+    }
+    if (this.priceSamples.length > ExchangeFeed.MAX_VOLATILITY_SAMPLES) {
+      this.priceSamples = this.priceSamples.slice(-ExchangeFeed.MAX_VOLATILITY_SAMPLES);
+    }
+  }
+
   private setPrice(exchange: string, price: number): void {
     this.prices.set(exchange, { price, timestamp: Date.now() });
   }
@@ -161,6 +200,7 @@ export class ExchangeFeed {
       price: median,
       timestamp: latestTs,
     };
+    this.recordPriceSample();
   }
 
   private evictStalePrices(): void {

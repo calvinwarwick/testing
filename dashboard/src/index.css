@@ -45,6 +45,25 @@ body {
   animation: live-dot-pulse 1.5s ease-in-out infinite;
 }
 
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-spin {
+  animation: spin 0.8s linear infinite;
+}
+
+/* Spinner for "Waiting for positions" – visible circle with one accent segment */
+.waiting-spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid #2d2d2d;
+  border-top-color: #fafafa;
+  border-radius: 50%;
+  animation: spin 1.3s linear infinite;
+}
+
 /* Log categories – distinct colours per category */
 .log-cat-error {
   color: #ef4444;

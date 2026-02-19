@@ -122,4 +122,59 @@ describe("ArbitrageDetector", () => {
       expect(opp!.totalCost).toBeGreaterThanOrEqual(1.0);
     });
   });
+
+  describe("detectEndgameOpportunity", () => {
+    it("returns endgame opportunity when near-certain side is in range", () => {
+      detector.setWindowReference(65000, Math.floor(Date.now() / 1000));
+      // YES at 0.96 (UP side nearly certain), NO at 0.04
+      const prices = makeMockPrices(0.96, 0.04, {
+        yesBestAskSize: 100,
+        noBestAskSize: 100,
+      });
+      const exchangePrice = makeMockExchangePrice(65100); // above ref -> UP
+      const opp = detector.detectEndgameOpportunity(
+        prices,
+        exchangePrice,
+        45,
+        { endgameMinProbability: 0.93, endgameMaxAsk: 0.98, minAskSizeShares: 50 }
+      );
+      expect(opp).not.toBeNull();
+      expect(opp!.opportunityType).toBe("endgame");
+      expect(opp!.exchangeSignal).toBe("UP");
+      expect(opp!.yesPrice).toBe(0.96);
+      expect(opp!.profitPerShare).toBeGreaterThan(0);
+    });
+
+    it("returns null when target ask above endgameMaxAsk", () => {
+      detector.setWindowReference(65000, Math.floor(Date.now() / 1000));
+      const prices = makeMockPrices(0.99, 0.01, {
+        yesBestAskSize: 100,
+        noBestAskSize: 100,
+      });
+      const exchangePrice = makeMockExchangePrice(65100);
+      const opp = detector.detectEndgameOpportunity(
+        prices,
+        exchangePrice,
+        30,
+        { endgameMinProbability: 0.93, endgameMaxAsk: 0.98, minAskSizeShares: 50 }
+      );
+      expect(opp).toBeNull();
+    });
+
+    it("returns null when signal is NEUTRAL", () => {
+      detector.setWindowReference(65000, Math.floor(Date.now() / 1000));
+      const prices = makeMockPrices(0.96, 0.04, {
+        yesBestAskSize: 100,
+        noBestAskSize: 100,
+      });
+      const exchangePrice = makeMockExchangePrice(65000); // no move
+      const opp = detector.detectEndgameOpportunity(
+        prices,
+        exchangePrice,
+        40,
+        { endgameMinProbability: 0.93, endgameMaxAsk: 0.98, minAskSizeShares: 50 }
+      );
+      expect(opp).toBeNull();
+    });
+  });
 });

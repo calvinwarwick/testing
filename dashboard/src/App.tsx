@@ -163,7 +163,7 @@ function formatBotRunTime(startTimeMs: number | undefined): string {
   return parts.join(" ");
 }
 
-type ExecutionLike = { settled: boolean; actualProfit: number; side: "UP" | "DOWN"; timestamp: number };
+type ExecutionLike = { settled: boolean; actualProfit: number; side: "UP" | "DOWN"; timestamp: number; entry?: string; size?: number };
 
 /** In-depth stats derived from settled trades (chronological order for streaks) */
 function getTradingStats(list: ExecutionLike[]) {
@@ -173,8 +173,10 @@ function getTradingStats(list: ExecutionLike[]) {
   const totalPnl = settled.reduce((s, e) => s + e.actualProfit, 0);
   const grossProfit = wins.reduce((s, e) => s + e.actualProfit, 0);
   const grossLoss = losses.reduce((s, e) => s + e.actualProfit, 0); // negative
-  const profitFactor =
-    grossLoss < 0 ? (grossProfit / Math.abs(grossLoss)) : (wins.length > 0 ? Infinity : 0);
+  const tradingVolume = settled.reduce((s, e) => {
+    if (e.entry != null && e.size != null) return s + orderValueDollars(e.entry, e.size);
+    return s;
+  }, 0);
   const expectancy = settled.length > 0 ? totalPnl / settled.length : 0;
   // Win rate = wins / (wins + losses) - only count profitable vs losing trades
   const totalWinLossTrades = wins.length + losses.length;
@@ -227,7 +229,7 @@ function getTradingStats(list: ExecutionLike[]) {
     totalPnl,
     grossProfit,
     grossLoss,
-    profitFactor,
+    tradingVolume,
     expectancy,
     winRatePct,
     bySide,
@@ -462,10 +464,7 @@ export default function App() {
           aria-live="polite"
           aria-busy="true"
         >
-          <div
-            className="w-10 h-10 border-2 border-edge border-t-primary rounded-full animate-spin"
-            aria-hidden
-          />
+          <span className="waiting-spinner shrink-0" aria-hidden />
           <span className="text-muted text-sm">Loading dashboard…</span>
         </div>
       )}
@@ -948,8 +947,8 @@ export default function App() {
                     </div>
                     <div className="border-b border-edge">
                       <div className="flex items-center justify-between gap-4 py-1.5 px-4">
-                        <span className="text-muted shrink-0">Profit factor</span>
-                        <span className="tabular-nums text-primary font-medium">{s.grossLoss < 0 ? (s.profitFactor >= 99.99 ? "∞" : s.profitFactor.toFixed(2)) : (s.wins.length > 0 ? "∞" : "—")}</span>
+                        <span className="text-muted shrink-0">Trading volume</span>
+                        <span className="tabular-nums text-primary font-medium">{formatUsd(s.tradingVolume)}</span>
                       </div>
                     </div>
                     <div className="border-b border-edge">
@@ -1144,12 +1143,17 @@ export default function App() {
               );
               if (displayList.length === 0) {
                 return (
-                  <div className="text-muted text-sm p-4">
-                    {positionsTab === "open"
-                      ? "No open positions."
-                      : positionsTab === "pending"
-                      ? "No pending settlements."
-                      : "No closed positions yet."}
+                  <div className="text-muted text-sm p-4 flex justify-center items-center">
+                    {positionsTab === "open" ? (
+                      <div className="flex items-center gap-2">
+                        <span className="waiting-spinner shrink-0" />
+                        <span>Waiting for positions</span>
+                      </div>
+                    ) : positionsTab === "pending" ? (
+                      "No pending settlements."
+                    ) : (
+                      "No closed positions yet."
+                    )}
                   </div>
                 );
               }
@@ -1207,7 +1211,7 @@ export default function App() {
                                     : e.settled
                                       ? "Resolved \u2713"
                                       : e.pendingSettlement
-                                        ? "Pending..."
+                                        ? "Pending"
                                         : e.fullyExecuted
                                           ? "Open"
                                           : "partial"}
@@ -1215,21 +1219,25 @@ export default function App() {
                             </div>
                           </div>
                           <div className="flex flex-col items-end shrink-0 ml-2">
-                            <span
-                              className={`font-mono text-sm font-medium ${displayProfit >= 0 ? "text-positive" : "text-negative"}`}
-                              title={
-                                showLive
-                                  ? "Live (mark-to-market)"
-                                  : e.profitTaken
-                                    ? "Trailing take-profit (profit locked in before window end)"
-                                    : e.lossCapped
-                                      ? "Stopped at 5% loss (position exited early; full loss if held to resolution)"
-                                      : undefined
-                              }
-                            >
-                              {displayProfit >= 0 ? "+" : ""}
-                              {formatUsdSmall(displayProfit)}
-                            </span>
+                            {e.pendingSettlement ? (
+                              <span className="waiting-spinner shrink-0" title="Settlement pending" />
+                            ) : (
+                              <span
+                                className={`font-mono text-sm font-medium ${displayProfit >= 0 ? "text-positive" : "text-negative"}`}
+                                title={
+                                  showLive
+                                    ? "Live (mark-to-market)"
+                                    : e.profitTaken
+                                      ? "Trailing take-profit (profit locked in before window end)"
+                                      : e.lossCapped
+                                        ? "Stopped at 5% loss (position exited early; full loss if held to resolution)"
+                                        : undefined
+                                }
+                              >
+                                {displayProfit >= 0 ? "+" : ""}
+                                {formatUsdSmall(displayProfit)}
+                              </span>
+                            )}
                           </div>
                         </div>
                         </div>

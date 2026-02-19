@@ -73,7 +73,7 @@ function makeExecution(slug: string, detectedAt: number, cost: number): Arbitrag
 }
 
 describe("demo capital controls", () => {
-  it("caps to 5% of current balance", () => {
+  it("caps to 15% of current balance (hard cap)", () => {
     const d = decideDemoCapitalSizing({
       startingBalanceUsd: 1000,
       lifetimeProfitUsd: 0,
@@ -82,8 +82,8 @@ describe("demo capital controls", () => {
       suggestedSize: 2000, // attempted $1000
     });
     expect(d.allowed).toBe(true);
-    expect(d.finalSuggestedSize).toBe(100); // $50 notional cap
-    expect(d.maxAllowedNotionalUsd).toBe(50);
+    expect(d.finalSuggestedSize).toBe(300); // $150 notional cap (15% of $1000)
+    expect(d.maxAllowedNotionalUsd).toBe(150);
   });
 
   it("blocks new trades when free cash cannot buy one share", () => {
