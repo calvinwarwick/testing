@@ -466,10 +466,14 @@ export class PolymarketArbBot {
     if (this.config.dryRun && (this.config.demoStartingBalance ?? 0) > 0) {
       const balance = (this.config.demoStartingBalance ?? 1000) + profit;
       balancePart = ` | balance $${balance.toFixed(2)}`;
+    } else if (!this.config.dryRun && this.walletBalance != null) {
+      balancePart = ` | wallet $${this.walletBalance.toFixed(2)}`;
     }
 
+    const openPositions = this.executions.filter(e => e.fullyExecuted && !e.settled && !e.pendingSettlement).length;
+    const riskState = this.riskManager.getState();
     logger.info(
-      `[Progress] uptime ${uptimeStr} | trades ${trades} | win rate ${winRateStr} | PnL ${profitStr}${balancePart}`
+      `[Progress] uptime ${uptimeStr} | trades ${trades} | win rate ${winRateStr} | PnL ${profitStr}${balancePart} | open: ${openPositions} | opportunities: ${this.stats.opportunitiesFound}`
     );
   }
 
@@ -487,10 +491,15 @@ export class PolymarketArbBot {
       candidates.find((m) => m.startTime <= nowSec && nowSec < m.endTime) ??
       candidates.find((m) => m.startTime === currentWindowStart) ??
       null;
+    const previousCount = this.activeMarkets.length;
     this.activeMarkets = currentMarket ? [currentMarket] : [];
 
     if (this.activeMarkets.length === 0) {
-      logger.warn("No active BTC 5-min markets found on Polymarket");
+      logger.warn("[Discovery] No active BTC 5-min markets found on Polymarket");
+    } else if (this.activeMarkets.length !== previousCount || this.activeMarkets[0]?.slug !== currentMarket?.slug) {
+      const market = this.activeMarkets[0];
+      const secRemaining = market.endTime - nowSec;
+      logger.info(`[Discovery] Active market: ${market.slug} | window: ${new Date(market.startTime * 1000).toISOString()} | ${secRemaining}s remaining`);
     }
 
     // Window start price: only from Chainlink (when configured) or Polymarket scraping — never from exchange/previous-window
@@ -573,6 +582,11 @@ export class PolymarketArbBot {
    */
   private async cycle(): Promise<void> {
     this.stats.cyclesRun++;
+    
+    // Log cycle start every 10 cycles (to avoid spam but show activity)
+    if (this.stats.cyclesRun % 10 === 0) {
+      logger.info(`[Cycle ${this.stats.cyclesRun}] Monitoring markets and prices...`);
+    }
 
     // Track window boundary (window start price is set only via Chainlink or Polymarket scraping, never from exchange)
     const { startTime: currentWindowStart } = getCurrentFiveMinWindow();
@@ -628,7 +642,9 @@ export class PolymarketArbBot {
 
     const exchangePrice = this.exchangeFeed.getLatestPrice();
     if (!exchangePrice) {
-      logger.debug("No exchange price available yet");
+      if (this.stats.cyclesRun % 20 === 0) {
+        logger.warn("No exchange price available yet - waiting for Binance feed");
+      }
       return;
     }
 
@@ -692,6 +708,13 @@ export class PolymarketArbBot {
       }
     }
 
+    // Log market status periodically
+    if (this.stats.cyclesRun % 20 === 0 && this.activeMarkets.length > 0) {
+      const activeMarket = this.activeMarkets[0];
+      const secRemaining = activeMarket.endTime - nowSec;
+      logger.info(`[Market] ${activeMarket.slug} | ${secRemaining}s remaining | BTC: $${exchangePrice.price.toFixed(2)}`);
+    }
+    
     // Check each active market for opportunities (and cache prices for unrealized PnL)
     for (const market of this.activeMarkets) {
       if (market.endTime <= nowSec) {
@@ -721,7 +744,18 @@ export class PolymarketArbBot {
         exchangePrice.price,
         actualWindowStartPrice
       );
-      if (!prices) continue;
+      if (!prices) {
+        if (this.stats.cyclesRun % 30 === 0) {
+          logger.debug(`[Market] ${market.slug}: Failed to fetch Polymarket prices`);
+        }
+        continue;
+      }
+      
+      // Log market prices periodically
+      if (this.stats.cyclesRun % 30 === 0) {
+        const secRemaining = market.endTime - nowSec;
+        logger.info(`[Prices] ${market.slug} | YES: ${(prices.yesBestAsk * 100).toFixed(1)}¢ | NO: ${(prices.noBestAsk * 100).toFixed(1)}¢ | ${secRemaining}s left`);
+      }
       this.lastMarketPricesBySlug.set(market.slug, {
         yesBestAsk: prices.yesBestAsk,
         noBestAsk: prices.noBestAsk,
@@ -735,7 +769,9 @@ export class PolymarketArbBot {
 
       // Skip markets where we don't have the actual window start price.
       if (actualWindowStartPrice == null) {
-        logger.debug(`Skipping ${market.slug}: no window start price captured`);
+        if (this.stats.cyclesRun % 20 === 0) {
+          logger.warn(`[Market] ${market.slug}: No window start price captured yet - cannot detect opportunities`);
+        }
         continue;
       }
 
@@ -761,9 +797,12 @@ export class PolymarketArbBot {
           }
         );
         if (endgameOpp) {
+          logger.info(`[Endgame] Opportunity detected: ${endgameOpp.exchangeSignal} | prob: ${(endgameOpp.estimatedWinProbability! * 100).toFixed(1)}% | edge: ${endgameOpp.profitPercent.toFixed(1)}%`);
           endgameOpp.windowStartBtcPrice = actualWindowStartPrice;
           await this.handleOpportunity(endgameOpp);
           continue;
+        } else if (this.stats.cyclesRun % 10 === 0 && secondsRemaining <= 60) {
+          logger.debug(`[Endgame] Checking ${market.slug} (${secondsRemaining}s left) - no opportunity found`);
         }
       }
 
@@ -797,9 +836,19 @@ export class PolymarketArbBot {
         minWinProbability,
         minAskSize
       );
-      if (directionalOpp && !this.config.pauseDirectionalTrading) {
-        directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
-        await this.handleOpportunity(directionalOpp);
+      if (directionalOpp) {
+        if (!this.config.pauseDirectionalTrading) {
+          logger.info(`[Directional] Opportunity detected: ${directionalOpp.exchangeSignal} | edge: ${directionalOpp.profitPercent.toFixed(1)}% | prob: ${(directionalOpp.estimatedWinProbability! * 100).toFixed(1)}% | cost: $${(directionalOpp.totalCost * directionalOpp.suggestedSize).toFixed(2)}`);
+          directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
+          await this.handleOpportunity(directionalOpp);
+        } else {
+          logger.debug(`[Directional] Opportunity found but paused: ${directionalOpp.exchangeSignal} | edge: ${directionalOpp.profitPercent.toFixed(1)}%`);
+        }
+      } else if (this.stats.cyclesRun % 30 === 0 && secondsRemaining >= 60 && secondsRemaining <= 210) {
+        // Log why no opportunity was found when we're in the trading window
+        const signal = this.detector.getExchangeSignal(exchangePrice.price, signalThreshold);
+        const pctMove = actualWindowStartPrice ? Math.abs(((exchangePrice.price - actualWindowStartPrice) / actualWindowStartPrice) * 100) : 0;
+        logger.debug(`[Directional] No opportunity: signal=${signal} | move=${pctMove.toFixed(2)}% | need ${minMove * 100}%+ | edge need ${minEdge}%+`);
       }
     }
 
@@ -826,6 +875,13 @@ export class PolymarketArbBot {
     }
     
     this.trimExecutions();
+    
+    // Log cycle summary periodically
+    if (this.stats.cyclesRun % 50 === 0) {
+      const openPositions = this.executions.filter(e => e.fullyExecuted && !e.settled && !e.pendingSettlement).length;
+      logger.info(`[Summary] Cycles: ${this.stats.cyclesRun} | Open positions: ${openPositions} | Opportunities found: ${this.stats.opportunitiesFound} | Trades executed: ${this.lifetimeTradesExecuted} | PnL: $${this.lifetimeTotalProfit.toFixed(2)}`);
+    }
+    
     await this.broadcastDashboardState(exchangePrice);
   }
 
@@ -1325,14 +1381,14 @@ export class PolymarketArbBot {
       const minSecLeft = this.config.minSecondsRemainingInWindow ?? 15;
       const maxSecLeft = this.config.maxSecondsRemainingInWindow ?? 270;
       if (marketSecondsRemaining < minSecLeft) {
-        logger.debug(
-          `Skip directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s)`
+        logger.info(
+          `[Skip] Directional: only ${marketSecondsRemaining}s left in market window (min ${minSecLeft}s) | ${opportunity.exchangeSignal} opportunity`
         );
         return;
       }
       if (marketSecondsRemaining > maxSecLeft) {
-        logger.debug(
-          `Skip directional: too early in window (${marketSecondsRemaining}s remaining, max ${maxSecLeft}s)`
+        logger.info(
+          `[Skip] Directional: too early in window (${marketSecondsRemaining}s remaining, max ${maxSecLeft}s) | ${opportunity.exchangeSignal} opportunity`
         );
         return;
       }
@@ -1347,7 +1403,7 @@ export class PolymarketArbBot {
         if (isEndgame) {
           this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, msg);
         } else {
-          logger.debug(`Skip trade: ${msg}`);
+          logger.info(`[Skip] ${msg} | ${opportunity.exchangeSignal} opportunity blocked`);
         }
         return;
       }
@@ -1452,14 +1508,7 @@ export class PolymarketArbBot {
       if (isEndgame) {
         this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, reason);
       } else {
-        const isExpectedLimit =
-          reason.includes("Min time between trades") ||
-          reason.includes("Max open positions reached");
-        if (isExpectedLimit) {
-          logger.debug(`Trade blocked by risk: ${reason}`);
-        } else {
-          logger.warn(`Trade blocked by risk: ${reason}`);
-        }
+        logger.info(`[Skip] Risk check failed: ${reason} | ${toExecute.exchangeSignal} opportunity`);
       }
       return;
     }
