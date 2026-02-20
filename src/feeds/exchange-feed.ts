@@ -10,9 +10,9 @@ const MAX_PRICE_AGE_MS = 10000;
 type PriceEntry = { price: number; timestamp: number };
 
 /**
- * Fetches real-time BTC price from multiple CEXes and aggregates (median).
- * Uses Binance WebSocket for low-latency plus REST polling for Binance,
- * Coinbase, OKX, Bybit, Kraken, and Bitfinex.
+ * Fetches real-time BTC price from Binance only.
+ * Uses Binance WebSocket for low-latency plus REST polling for Binance.
+ * Other exchanges are still polled for reference but not used for trading.
  */
 export class ExchangeFeed {
   private ws: WebSocket | null = null;
@@ -183,22 +183,15 @@ export class ExchangeFeed {
 
   private recomputeAggregated(): void {
     this.evictStalePrices();
-    if (this.prices.size === 0) return;
-    const values = Array.from(this.prices.values()).map((e) => e.price);
-    values.sort((a, b) => a - b);
-    const mid = Math.floor(values.length / 2);
-    const median =
-      values.length % 2 !== 0
-        ? values[mid]
-        : (values[mid - 1] + values[mid]) / 2;
-    const latestTs = Math.max(
-      ...Array.from(this.prices.values()).map((e) => e.timestamp)
-    );
+    // Use only Binance price instead of median
+    const binancePrice = this.prices.get("binance");
+    if (!binancePrice) return;
+    
     this.aggregated = {
-      exchange: "aggregated",
+      exchange: "binance",
       symbol: "BTCUSDT",
-      price: median,
-      timestamp: latestTs,
+      price: binancePrice.price,
+      timestamp: binancePrice.timestamp,
     };
     this.recordPriceSample();
   }

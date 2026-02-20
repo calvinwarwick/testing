@@ -52,6 +52,8 @@ export interface DashboardState {
   };
   /** Demo mode: starting balance and current balance (starting + totalProfit) */
   demoBalance?: { startingUsd: number; currentUsd: number };
+  /** Live mode: current USDC wallet balance */
+  walletBalance?: number;
   mode: "dry_run" | "live";
   /** Recent persisted logs (sent with state to hydrate dashboard on startup). */
   recentLogs?: DashboardLogEntry[];

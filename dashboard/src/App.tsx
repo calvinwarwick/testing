@@ -163,11 +163,11 @@ function formatBotRunTime(startTimeMs: number | undefined): string {
   return parts.join(" ");
 }
 
-type ExecutionLike = { settled: boolean; actualProfit: number; side: "UP" | "DOWN"; timestamp: number; entry?: string; size?: number };
+type ExecutionLike = { settled: boolean; actualProfit: number; side: "UP" | "DOWN"; timestamp: number; entry?: string; size?: number; pendingSettlement?: boolean };
 
-/** In-depth stats derived from settled trades (chronological order for streaks) */
+/** In-depth stats derived from settled trades (chronological order for streaks). Open and pending positions are excluded until resolved. */
 function getTradingStats(list: ExecutionLike[]) {
-  const settled = list.filter((e) => e.settled);
+  const settled = list.filter((e) => e.settled && !e.pendingSettlement);
   const wins = settled.filter((e) => e.actualProfit > 0);
   const losses = settled.filter((e) => e.actualProfit < 0);
   const totalPnl = settled.reduce((s, e) => s + e.actualProfit, 0);
@@ -312,15 +312,19 @@ export default function App() {
   const dailyPnL = state?.risk?.dailyPnL ?? 0;
   const tradesExecuted = state?.stats?.tradesExecuted ?? 0;
   const demoBalance = state?.demoBalance;
+  const walletBalance = state?.walletBalance;
   const dataMode = state?.dataMode ?? "live";
   const modeReason = state?.modeReason;
   const hasLiveMarketData = dataMode === "live";
   const executions = state?.executions ?? [];
+  const listForStats = state?.tradeHistory ?? state?.executions ?? [];
   const openTradesValue =
     executions
       .filter((e) => e.fullyExecuted && !e.settled && !e.pendingSettlement)
       .reduce((sum, e) => sum + orderValueDollars(e.entry, e.size), 0) ?? 0;
-  const tradesWon = state?.stats?.profitableTrades ?? executions.filter((e) => e.settled && e.actualProfit > 0).length;
+  const resolvedExecutions = listForStats.filter((e) => e.settled && !e.pendingSettlement);
+  const tradesWon = state?.stats?.profitableTrades ?? resolvedExecutions.filter((e) => e.actualProfit > 0).length;
+  const resolvedCount = resolvedExecutions.length;
   const avgTrade =
     state?.stats && state.stats.tradesExecuted > 0
       ? state.stats.totalProfit / state.stats.tradesExecuted
@@ -376,16 +380,80 @@ export default function App() {
       ? Math.max(0, (cexProbability / 100 - liveTargetAsk) / (1 - liveTargetAsk))
       : null;
   const fiveMinAgo = Date.now() - FIVE_MIN_MS;
+  
+  // Build PnL chart from trade history: each settled trade is a point showing cumulative PnL
+  const settledTrades = listForStats
+    .filter((e) => e.settled && !e.pendingSettlement && typeof e.actualProfit === 'number' && !isNaN(e.actualProfit))
+    .sort((a, b) => a.timestamp - b.timestamp);
+  
+  let runningTotal = 0;
+  const rawData = settledTrades.map((trade) => {
+    runningTotal += trade.actualProfit || 0;
+    return {
+      t: trade.timestamp,
+      v: runningTotal,
+      profit: trade.actualProfit, // Store individual profit for styling
+    };
+  });
+  
+  // Apply smoothing to reduce jaggedness
+  const smoothedData = rawData.length > 2 ? rawData.map((point, index) => {
+    if (index === 0 || index === rawData.length - 1) {
+      return point; // Keep first and last points unchanged
+    }
+    // Simple moving average with neighbors
+    const prev = rawData[index - 1].v;
+    const curr = point.v;
+    const next = rawData[index + 1].v;
+    return {
+      ...point,
+      v: (prev + curr + next) / 3, // Average with neighbors
+    };
+  }) : rawData;
+  
+  const pnlChartDataFromTrades = smoothedData;
+  
+  // Fallback to pnlHistory or demo data if no trades
   const pnlChartData =
-    pnlHistory.length > 0 ? pnlHistory : cumulativePnl.series;
-  const btcChartData =
-    btcHistory.length > 0
-      ? btcHistory.filter((pt) => pt.t >= fiveMinAgo)
+    pnlChartDataFromTrades.length > 0
+      ? pnlChartDataFromTrades
+      : pnlHistory.length > 0
+      ? pnlHistory
+      : cumulativePnl.series;
+  
+  // BTC chart: show data for the current 5-minute window
+  const windowStartTime = state?.windowStartTime;
+  const windowEndTime = state?.windowEndTime;
+  const windowStartBtcPrice = state?.windowStartBtcPrice;
+  const windowStartMs = windowStartTime ? windowStartTime * 1000 : null;
+  const windowEndMs = windowEndTime ? windowEndTime * 1000 : null;
+  
+  let btcChartData =
+    btcHistory.length > 0 && windowStartMs != null && windowEndMs != null
+      ? btcHistory.filter((pt) => pt.t >= windowStartMs && pt.t <= windowEndMs)
+      : btcHistory.length > 0
+      ? btcHistory.filter((pt) => pt.t >= fiveMinAgo) // Fallback to last 5 min if no window
       : btcSeries;
-  const pnlChartSeries = [...pnlChartData].sort((a, b) => a.t - b.t);
+  
+  // Add window start price point if available and not already in data
+  if (windowStartMs != null && windowStartBtcPrice != null && btcChartData.length > 0) {
+    const hasStartPoint = btcChartData.some((pt) => Math.abs(pt.t - windowStartMs) < 1000);
+    if (!hasStartPoint) {
+      btcChartData = [
+        { t: windowStartMs, v: windowStartBtcPrice },
+        ...btcChartData,
+      ];
+    }
+  }
+  const pnlChartSeries = [...pnlChartData]
+    .filter((pt) => typeof pt.v === 'number' && !isNaN(pt.v) && typeof pt.t === 'number' && !isNaN(pt.t))
+    .sort((a, b) => a.t - b.t);
   const btcChartSeries = [...btcChartData].sort((a, b) => a.t - b.t);
   const pnlXDomain = getChartDomain(pnlChartSeries);
-  const btcXDomain = getChartDomain(btcChartSeries);
+  // Use window boundaries for BTC chart X-axis domain
+  const btcXDomain = windowStartMs != null && windowEndMs != null
+    ? [windowStartMs, windowEndMs]
+    : getChartDomain(btcChartSeries);
   const liveWindowRemainingSec =
     state?.windowEndTime != null
       ? Math.max(0, state.windowEndTime - Math.floor(Date.now() / 1000))
@@ -498,12 +566,18 @@ export default function App() {
           )}
         </div>
         <div className="flex items-start [&>*]:border-l [&>*]:border-edge [&>*]:px-4 [&>*:first-child]:border-0 [&>*:first-child]:pl-0">
-          {demoBalance != null && (
+          {(demoBalance != null || walletBalance != null) && (
             <div className="flex flex-col gap-0.5 items-center">
               <span className="text-muted text-[10px] uppercase tracking-wider text-center">Balance</span>
-              <span className="font-mono font-medium text-primary text-sm" title={`Starting: $${demoBalance.startingUsd.toLocaleString()}`}>
-                {formatUsd(demoBalance.currentUsd)}
-              </span>
+              {demoBalance != null ? (
+                <span className="font-mono font-medium text-primary text-sm" title={`Starting: $${demoBalance.startingUsd.toLocaleString()}`}>
+                  {formatUsd(demoBalance.currentUsd)}
+                </span>
+              ) : walletBalance != null ? (
+                <span className="font-mono font-medium text-primary text-sm">
+                  {formatUsd(walletBalance)}
+                </span>
+              ) : null}
             </div>
           )}
           <div className="flex flex-col gap-0.5 items-center">
@@ -527,7 +601,7 @@ export default function App() {
           <div className="flex flex-col gap-0.5 items-center">
             <span className="text-muted text-[10px] uppercase tracking-wider text-center">Win rate</span>
             <span className="font-mono text-primary text-sm">
-              {tradesExecuted > 0 ? `${((tradesWon / tradesExecuted) * 100).toFixed(1)}%` : "—"}
+              {resolvedCount > 0 ? `${((tradesWon / resolvedCount) * 100).toFixed(1)}%` : "—"}
             </span>
           </div>
           <div className="flex flex-col gap-0.5 items-center">
@@ -599,11 +673,12 @@ export default function App() {
                 margin={{ top: 4, right: 4, left: 4, bottom: 4 }}
               >
                 <Line
-                  type="monotone"
+                  type="basis"
                   dataKey="v"
                   stroke="#ffffff"
-                  strokeWidth={1.5}
+                  strokeWidth={2}
                   dot={false}
+                  isAnimationActive={false}
                 />
                 <XAxis dataKey="t" hide type="number" domain={pnlXDomain} />
                 <YAxis hide domain={["dataMin", "dataMax"]} />

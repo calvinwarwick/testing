@@ -60,25 +60,76 @@ export class Trader {
   }
 
   /**
+   * Get USDC balance from wallet (for live trading).
+   * USDC on Polygon: 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359 (native USDC)
+   */
+  async getUsdcBalance(): Promise<number | null> {
+    if (!this.wallet || this.config.dryRun) return null;
+    try {
+      const provider = new ethers.JsonRpcProvider(this.config.polygonRpcUrl);
+      // USDC native on Polygon
+      const usdcAddress = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
+      const usdcAbi = [
+        "function balanceOf(address owner) view returns (uint256)",
+        "function decimals() view returns (uint8)",
+      ];
+      const usdcContract = new ethers.Contract(usdcAddress, usdcAbi, provider);
+      const balance = await usdcContract.balanceOf(this.wallet.address);
+      const decimals = await usdcContract.decimals();
+      const balanceUsd = Number(balance) / 10 ** Number(decimals);
+      return balanceUsd;
+    } catch (error) {
+      logger.debug("Failed to fetch USDC balance", { error: String(error) });
+      return null;
+    }
+  }
+
+  /** CLOB L1 auth: fixed message for EIP-712 derive-api-key signature */
+  private static readonly CLOB_AUTH_MESSAGE =
+    "This message attests that I control the given wallet";
+
+  /**
    * Derive L2 API credentials from the wallet.
-   * The CLOB API uses HMAC-SHA256 for L2 auth (faster than signing every request).
+   * Uses GET /auth/derive-api-key with L1 headers (POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_NONCE).
+   * POLY_SIGNATURE is EIP-712 ClobAuth, not personal_sign.
    */
   private async deriveApiCredentials(): Promise<void> {
     if (!this.wallet) throw new Error("Wallet not initialized");
 
     try {
-      // Create or derive API key using the CLOB endpoint
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const nonce = "0";
-      const message = `${timestamp}${nonce}`;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const nonce = 0;
+      const address = await this.wallet.getAddress();
+      const ts = `${timestamp}`;
 
-      // Sign the message with our wallet
-      const signature = await this.wallet.signMessage(message);
-
-      const response = await this.httpClient.post("/auth/derive-api-key", {
-        timestamp,
+      const domain = {
+        name: "ClobAuthDomain",
+        version: "1",
+        chainId: 137,
+      };
+      const types = {
+        ClobAuth: [
+          { name: "address", type: "address" },
+          { name: "timestamp", type: "string" },
+          { name: "nonce", type: "uint256" },
+          { name: "message", type: "string" },
+        ],
+      };
+      const value = {
+        address,
+        timestamp: ts,
         nonce,
-        signature,
+        message: Trader.CLOB_AUTH_MESSAGE,
+      };
+      const signature = await this.wallet.signTypedData(domain, types, value);
+
+      const response = await this.httpClient.get("/auth/derive-api-key", {
+        headers: {
+          POLY_ADDRESS: address,
+          POLY_SIGNATURE: signature,
+          POLY_TIMESTAMP: ts,
+          POLY_NONCE: String(nonce),
+        },
       });
 
       this.apiKey = response.data.apiKey;

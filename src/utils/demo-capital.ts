@@ -20,6 +20,7 @@ export function calculateReservedCapital(
   const fromExecutions = executions
     .filter((e) => {
       if (!e.fullyExecuted) return false;
+      if (e.pendingSettlement === true) return false; // Don't reserve capital while waiting for Polymarket settlement
       const key = `${e.opportunity.market.slug}-${e.opportunity.detectedAt}`;
       return !releasedKeys.has(key);
     })

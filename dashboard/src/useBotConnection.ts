@@ -69,6 +69,7 @@ export interface BotState {
     profitableTrades?: number;
   };
   demoBalance?: { startingUsd: number; currentUsd: number };
+  walletBalance?: number;
   mode: "dry_run" | "live";
   /** Recent persisted logs to hydrate initial dashboard view. */
   recentLogs?: LogEntry[];

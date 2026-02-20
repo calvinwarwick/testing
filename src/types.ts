@@ -25,6 +25,12 @@ export interface BotConfig {
   dashboardWsPort?: number;
   /** Max concurrent open positions (default 3). Positions are released when their market window ends. */
   maxOpenPositions?: number;
+  /** Max positions allowed in a single 5-min window (default 1). Prevents concentrating full portfolio risk in one window. */
+  maxPositionsPerWindow?: number;
+  /** Max USD exposure in a single 5-min window (optional). If set, total cost of open positions in that window cannot exceed this. */
+  maxExposurePerWindowUsdc?: number;
+  /** Max fraction of current balance (0..1) allowed as exposure in a single window, e.g. 0.25 = 25% (optional). */
+  maxExposurePerWindowFraction?: number;
   /** Path to session persistence file (e.g. data/session.json) */
   sessionFile?: string;
   /** Min ms between trades (default 1000) */
@@ -33,6 +39,8 @@ export interface BotConfig {
   maxTradesPerMinute?: number;
   /** If true, only take directional trades (exchange vs Polymarket). */
   directionalOnly?: boolean;
+  /** If true, do not open new directional trades (endgame arb still allowed). */
+  pauseDirectionalTrading?: boolean;
   /** Min edge % for directional opportunities (default 5). Only enter when edge is clearly there. */
   minEdgePercent?: number;
   /** Exchange price must move this % vs window start for UP/DOWN signal (default 0.02). Higher = fewer, stronger signals. */

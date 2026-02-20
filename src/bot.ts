@@ -72,6 +72,9 @@ export class PolymarketArbBot {
   private isRunning = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private progressLogTimer: ReturnType<typeof setInterval> | null = null;
+  private walletBalance: number | null = null;
+  private lastBalanceFetch: number = 0;
+  private readonly BALANCE_FETCH_INTERVAL_MS = 30000; // Fetch balance every 30 seconds
   private activeMarkets: PolymarketMarket[] = [];
   private executions: ArbitrageExecution[] = [];
   private releasedPositionKeys = new Set<string>();
@@ -183,6 +186,20 @@ export class PolymarketArbBot {
     // Initialize components
     await this.exchangeFeed.start();
     await this.trader.initialize();
+    
+    // Fetch initial wallet balance in live mode
+    if (!this.config.dryRun) {
+      try {
+        const balance = await this.trader.getUsdcBalance();
+        if (balance != null) {
+          this.walletBalance = balance;
+          logger.info(`Wallet balance: $${balance.toFixed(2)} USDC`);
+        }
+        this.lastBalanceFetch = Date.now();
+      } catch (error) {
+        logger.debug("Failed to fetch initial wallet balance", { error: String(error) });
+      }
+    }
 
     // Load persistent data
     loadTradeRecords();
@@ -221,6 +238,31 @@ export class PolymarketArbBot {
 
   private getExecutionKey(execution: ArbitrageExecution): string {
     return `${execution.opportunity.market.slug}-${execution.opportunity.detectedAt}`;
+  }
+
+  /**
+   * Per-window limits prevent concentrating full portfolio risk in one 5-min window.
+   * Returns open position count and total exposure (USD) for the given market window.
+   */
+  private getPerWindowOpenCountAndExposure(windowStartTime: number): {
+    count: number;
+    exposureUsd: number;
+  } {
+    let count = 0;
+    let exposureUsd = 0;
+    for (const e of this.executions) {
+      if (!e.fullyExecuted || e.settled || e.pendingSettlement === true) continue;
+      if (e.opportunity.market.startTime !== windowStartTime) continue;
+      count++;
+      exposureUsd += e.actualTotalCost ?? 0;
+    }
+    const inMemoryIds = this.getInMemoryTradeIds();
+    for (const t of getTradeRecords()) {
+      if (t.settled || t.marketWindowStart !== windowStartTime || inMemoryIds.has(t.id)) continue;
+      count++;
+      exposureUsd += Number.isFinite(t.cost) ? t.cost : 0;
+    }
+    return { count, exposureUsd };
   }
 
   private getExecutionTradeId(execution: ArbitrageExecution): string | undefined {
@@ -755,7 +797,7 @@ export class PolymarketArbBot {
         minWinProbability,
         minAskSize
       );
-      if (directionalOpp) {
+      if (directionalOpp && !this.config.pauseDirectionalTrading) {
         directionalOpp.windowStartBtcPrice = actualWindowStartPrice;
         await this.handleOpportunity(directionalOpp);
       }
@@ -791,88 +833,9 @@ export class PolymarketArbBot {
    * Check open positions for stop loss and take profit conditions, exit if triggered.
    */
   private async checkStopLossAndTakeProfit(exchangePrice: ExchangePrice | null): Promise<void> {
-    if (!exchangePrice) return;
-    
-    const stopLossPercent = this.config.stopLossPercent ?? 0.10;
-    
-    // Skip if disabled
-    if (stopLossPercent === 0) return;
-    
-    const nowSec = Math.floor(Date.now() / 1000);
-    
-    for (const execution of this.executions) {
-      if (!execution.fullyExecuted || execution.settled || execution.pendingSettlement) continue;
-      if (execution.opportunity.market.endTime <= nowSec) continue; // Window ended, will be settled
-      
-      const key = this.getExecutionKey(execution);
-      const opp = execution.opportunity;
-      const isUp = opp.exchangeSignal === "UP";
-      const side = isUp ? "YES" : "NO";
-      const tokenId = isUp ? opp.market.yesTokenId : opp.market.noTokenId;
-      const entryPrice = isUp ? opp.yesPrice : opp.noPrice;
-      const filledSize = isUp ? (execution.yesTrade.filledSize ?? 0) : (execution.noTrade.filledSize ?? 0);
-      
-      if (filledSize === 0) continue;
-      
-      // Get current market price
-      const marketPrices = this.lastMarketPricesBySlug.get(opp.market.slug);
-      if (!marketPrices) continue;
-      
-      const currentBidPrice = isUp ? marketPrices.yesBestBid : marketPrices.noBestBid;
-      if (currentBidPrice === 0) continue; // No bid available
-      
-      // Calculate unrealized PnL
-      const unrealizedProfit = (currentBidPrice - entryPrice) * filledSize;
-      const entryCost = entryPrice * filledSize;
-      const pnlPercent = entryCost > 0 ? (unrealizedProfit / entryCost) : 0;
-      
-      let shouldExit = false;
-      let exitReason: "stop-loss" | null = null;
-      
-      // Check stop loss
-      if (stopLossPercent > 0 && pnlPercent <= -stopLossPercent) {
-        shouldExit = true;
-        exitReason = "stop-loss";
-      }
-      
-      if (shouldExit && exitReason) {
-        logger.info(`Exiting position: ${opp.market.slug} | ${exitReason} | PnL ${pnlPercent >= 0 ? "+" : ""}${(pnlPercent * 100).toFixed(1)}% ($${unrealizedProfit.toFixed(2)})`);
-        
-        try {
-          const sellResult = await this.trader.placeLimitSell(tokenId, currentBidPrice, filledSize, side);
-          if (sellResult.success && sellResult.filledSize && sellResult.filledSize > 0) {
-            const exitPrice = sellResult.price;
-            const actualProfit = (exitPrice - entryPrice) * sellResult.filledSize;
-            
-            execution.actualProfit = actualProfit;
-            execution.settled = true;
-            execution.lossCapped = exitReason === "stop-loss";
-            execution.profitTaken = false;
-            
-            this.lifetimeTotalProfit += actualProfit;
-            if (actualProfit > 0) this.lifetimeProfitableTrades++;
-            this._profitSyncDirty = true;
-            this.riskManager.recordSettlement(actualProfit);
-            
-            // Update trade record
-            const tradeId = this.getExecutionTradeId(execution);
-            if (tradeId) {
-              updateTradeSettlement(
-                tradeId,
-                actualProfit,
-                exchangePrice.price,
-                execution.lossCapped,
-                execution.profitTaken
-              );
-            }
-            
-            logger.info(`Position exited: ${opp.market.slug} | ${exitReason} | Profit $${actualProfit.toFixed(2)}`);
-          }
-        } catch (error) {
-          logger.error(`Failed to exit position ${opp.market.slug}: ${error}`);
-        }
-      }
-    }
+    // Stop loss / early exit logic disabled by configuration.
+    // Positions will be held until 5‑minute window resolution instead.
+    return;
   }
 
   /**
@@ -1113,6 +1076,20 @@ export class PolymarketArbBot {
   private async broadcastDashboardState(exchangePrice: { price: number; timestamp: number } | null): Promise<void> {
     if (!this.dashboard) return;
     this.syncLifetimeProfitFromTradeLog();
+    
+    // Fetch wallet balance periodically in live mode
+    if (!this.config.dryRun && Date.now() - this.lastBalanceFetch > this.BALANCE_FETCH_INTERVAL_MS) {
+      try {
+        const balance = await this.trader.getUsdcBalance();
+        if (balance != null) {
+          this.walletBalance = balance;
+        }
+        this.lastBalanceFetch = Date.now();
+      } catch (error) {
+        logger.debug("Failed to fetch wallet balance", { error: String(error) });
+      }
+    }
+    
     const { startTime, endTime } = getCurrentFiveMinWindow();
     const risk = this.riskManager.getState();
     const cexPrices: Record<string, number> = {};
@@ -1295,6 +1272,7 @@ export class PolymarketArbBot {
             currentUsd: (this.config.demoStartingBalance ?? 1000) + this.lifetimeTotalProfit,
           }
         : undefined,
+      walletBalance: !this.config.dryRun ? this.walletBalance ?? undefined : undefined,
       mode: this.config.dryRun ? "dry_run" : "live",
       executions: mergedExecutions,
       tradeHistory,
@@ -1360,6 +1338,21 @@ export class PolymarketArbBot {
       }
     }
 
+    // Per-window position limit: avoid concentrating full portfolio risk in one 5-min window
+    const maxPerWindow = this.config.maxPositionsPerWindow;
+    if (maxPerWindow != null && maxPerWindow > 0) {
+      const { count } = this.getPerWindowOpenCountAndExposure(opportunity.market.startTime);
+      if (count >= maxPerWindow) {
+        const msg = `max positions per window reached for this market (${count}/${maxPerWindow})`;
+        if (isEndgame) {
+          this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, msg);
+        } else {
+          logger.debug(`Skip trade: ${msg}`);
+        }
+        return;
+      }
+    }
+
     let toExecute = opportunity;
     if (this.config.dryRun && (this.config.demoStartingBalance ?? 1000) > 0) {
       const persistedTrades = getTradeRecords();
@@ -1379,7 +1372,11 @@ export class PolymarketArbBot {
       });
       if (!decision.allowed) {
         if (isEndgame) {
-          this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, `demo capital — ${decision.reason}`);
+          const detail =
+            decision.reason === "insufficient_available_cash"
+              ? `demo capital — ${decision.reason} (available $${decision.availableBalanceUsd.toFixed(2)}, reserved $${decision.reservedCapitalUsd.toFixed(2)}, need $${opportunity.totalCost.toFixed(2)})`
+              : `demo capital — ${decision.reason}`;
+          this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, detail);
         } else {
           logger.debug(`Skip trade: demo capital — ${decision.reason}`);
         }
@@ -1417,6 +1414,36 @@ export class PolymarketArbBot {
     }
 
     this.stats.opportunitiesFound++;
+
+    // Per-window exposure cap: total $ at risk in this window cannot exceed limit
+    const newCostUsd = toExecute.totalCost * toExecute.suggestedSize;
+    const { exposureUsd } = this.getPerWindowOpenCountAndExposure(opportunity.market.startTime);
+    const totalAfter = exposureUsd + newCostUsd;
+    const maxExposureUsdc = this.config.maxExposurePerWindowUsdc;
+    if (maxExposureUsdc != null && maxExposureUsdc > 0 && totalAfter > maxExposureUsdc) {
+      const msg = `max exposure per window would be exceeded ($${totalAfter.toFixed(2)} > $${maxExposureUsdc})`;
+      if (isEndgame) {
+        this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, msg);
+      } else {
+        logger.debug(`Skip trade: ${msg}`);
+      }
+      return;
+    }
+    const maxExposureFrac = this.config.maxExposurePerWindowFraction;
+    if (maxExposureFrac != null && maxExposureFrac > 0) {
+      const currentBalanceUsd =
+        (this.config.demoStartingBalance ?? 1000) + this.lifetimeTotalProfit;
+      const capUsd = currentBalanceUsd * maxExposureFrac;
+      if (totalAfter > capUsd) {
+        const msg = `max exposure per window (${(maxExposureFrac * 100).toFixed(0)}% of balance) would be exceeded ($${totalAfter.toFixed(2)} > $${capUsd.toFixed(2)})`;
+        if (isEndgame) {
+          this.logEndgameSkippedOnce(opportunity.market.slug, opportunity.market.endTime, msg);
+        } else {
+          logger.debug(`Skip trade: ${msg}`);
+        }
+        return;
+      }
+    }
 
     // Risk check
     const riskCheck = this.riskManager.checkTrade(toExecute);

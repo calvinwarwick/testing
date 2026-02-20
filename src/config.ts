@@ -38,6 +38,15 @@ export function loadConfig(): BotConfig {
     btc5mEventSlug: optionalEnv("POLYMARKET_BTC_5M_EVENT_SLUG", "") || undefined,
     dashboardWsPort: Number(process.env.PORT ?? optionalEnv("DASHBOARD_WS_PORT", "8765")) || 0,
     maxOpenPositions: Math.max(1, Number(optionalEnv("MAX_OPEN_POSITIONS", "50")) || 50),
+    maxPositionsPerWindow: Math.max(1, Number(optionalEnv("MAX_POSITIONS_PER_WINDOW", "1")) || 1),
+    maxExposurePerWindowUsdc: (() => {
+      const v = optionalEnv("MAX_EXPOSURE_PER_WINDOW_USDC", "");
+      return v === "" ? undefined : Math.max(1, Number(v) || 0) || undefined;
+    })(),
+    maxExposurePerWindowFraction: (() => {
+      const v = optionalEnv("MAX_EXPOSURE_PER_WINDOW_FRACTION", "");
+      return v === "" ? undefined : Math.max(0.01, Math.min(1, Number(v) || 0)) || undefined;
+    })(),
     sessionFile: optionalEnv("SESSION_FILE", "data/session.json") || undefined,
     minTimeBetweenTradesMs: Math.max(
       0,
@@ -45,6 +54,7 @@ export function loadConfig(): BotConfig {
     ),
     maxTradesPerMinute: Math.max(1, Number(optionalEnv("MAX_TRADES_PER_MINUTE", "50")) || 50),
     directionalOnly: optionalEnv("DIRECTIONAL_ONLY", "true") === "true",
+    pauseDirectionalTrading: optionalEnv("PAUSE_DIRECTIONAL_TRADING", "false") === "true",
     minEdgePercent: Math.max(1, Math.min(50, Number(optionalEnv("MIN_EDGE_PERCENT", "5")) || 5)),
     exchangeSignalThresholdPercent: Math.max(0.01, Math.min(1, Number(optionalEnv("EXCHANGE_SIGNAL_THRESHOLD_PERCENT", "0.02")) || 0.02)),
     minExchangeMovePercent: Math.max(0.02, Math.min(1, Number(optionalEnv("MIN_EXCHANGE_MOVE_PERCENT", "0.03")) || 0.03)),
