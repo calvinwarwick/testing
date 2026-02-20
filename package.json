@@ -11,7 +11,6 @@
     "dev:dashboard": "cd dashboard && npm run dev",
     "dashboard": "cd dashboard && npm run dev",
     "test": "jest --config jest.config.js",
-    "test:trade": "ts-node test-trade.ts",
     "lint": "eslint 'src/**/*.ts' 'tests/**/*.ts'",
     "reset": "node -e \"require('fs').rmSync('data/session.json',{force:true}); console.log('Session data reset.');\"",
     "reset:full": "node -e \"const fs=require('fs'); const d='data'; ['session.json','trades.json','historical-markets.json','logs.json'].forEach(f=>{ try { fs.rmSync(d+'/'+f,{force:true}); console.log('Removed '+d+'/'+f); } catch(e) {} }); console.log('Full reset done. Stop the bot first, then start again for a clean slate with DEMO_STARTING_BALANCE.');\""

@@ -143,16 +143,10 @@ export class ArbitrageDetector {
     minAskSizeShares: number = 50
   ): ArbitrageOpportunity | null {
     const signal = this.getExchangeSignal(exchangePrice.price, signalThresholdPercent);
-    if (signal === "NEUTRAL") {
-      // Only log occasionally to avoid spam
-      return null;
-    }
+    if (signal === "NEUTRAL") return null;
 
     // Confirm momentum before proceeding
-    if (!this.confirmMomentum(signal)) {
-      logger.debug(`[Detector] Signal ${signal} detected but momentum not confirmed`);
-      return null;
-    }
+    if (!this.confirmMomentum(signal)) return null;
 
     // If exchange says UP, the YES token should be more expensive
     // If exchange says DOWN, the NO token should be more expensive
@@ -180,10 +174,7 @@ export class ArbitrageDetector {
     );
 
     // Only enter when the exchange move is meaningful (avoids trading on noise)
-    if (pctMove < minExchangeMovePercent) {
-      logger.debug(`[Detector] Exchange move ${pctMove.toFixed(2)}% below minimum ${(minExchangeMovePercent * 100).toFixed(2)}%`);
-      return null;
-    }
+    if (pctMove < minExchangeMovePercent) return null;
 
     // Map exchange move magnitude to base probability (conservative estimate)
     // Larger moves are more likely to hold, but account for mean reversion
